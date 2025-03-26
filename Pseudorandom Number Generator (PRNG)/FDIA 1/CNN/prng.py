@@ -1,122 +1,202 @@
 import os
-import numpy as np
 import cv2
+import numpy as np
 import pandas as pd
+import random
+import string
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+import matplotlib as mpl
+import tensorflow as tf
 from tensorflow.keras.models import load_model
+from tf_keras_vis.saliency import Saliency
+from tf_keras_vis.utils.model_modifiers import ReplaceToLinear
 
-# ---------------- Parameters ---------------- #
-input_folder = "PRNG/Images FDIA 1/Normal"
-attacked_folder = "PRNG/attacked_images"
-model_path = "PRNG/cnn_2_class_model_grayscale.h5"
-output_excel = "PRNG/prng_pixel_encoding_results.xlsx"
+mpl.rcParams['font.family'] = 'DejaVu Sans'
 
-img_input_size = (128, 128)
-secret_seed = 12345
-prng_pixel_count = 25
-bits_per_coord = 16
-total_bits = prng_pixel_count * bits_per_coord * 2  # 800 bits
+# === CONFIGURATION === #
+IMG_SIZE = (128, 128)  # Updated to 128x128 for the new CNN model
+NUM_PIXELS = 24  # Number of PRNG selected pixels for embedding
+BITS_PER_COORD = 16
+RESERVED_BITS = NUM_PIXELS * BITS_PER_COORD * 2  # Coordinate storage size
+MESSAGE_BITS = NUM_PIXELS  # 24 bits for message (3 characters)
+CHANNELS = 1
+CLASS_NAMES = ['Normal', 'Faulty']  # Updated for your CNN model's classes
 
-# Create attacked folder
-os.makedirs(attacked_folder, exist_ok=True)
+# === MESSAGE UTILS === #
+def generate_random_message(chars=3):
+    # Generate a 3-character message with only alphabetic letters
+    return ''.join(random.choices(string.ascii_letters, k=chars))
 
-# ---------------- PRNG & LSB Functions ---------------- #
+def string_to_bits(s):
+    # Convert the message into bits (24 bits for 3 characters)
+    return [int(b) for c in s.encode('utf-8') for b in format(c, '08b')][:MESSAGE_BITS]
+
+def bits_to_string(bits):
+    chars = []
+    for i in range(0, len(bits), 8):
+        byte = bits[i:i+8]
+        if len(byte) == 8:
+            chars.append(chr(int(''.join(map(str, byte)), 2)))
+    return ''.join(chars)
+
+def clean_excel_string(s):
+    # Clean the string to include only letters (no spaces, no numbers)
+    return ''.join(c for c in s if c.isalpha())
+
+# === COORDINATE CONVERSION === #
+def coords_to_bits(coords):
+    bits = []
+    for y, x in coords:
+        yb = format(y, f'0{BITS_PER_COORD}b')
+        xb = format(x, f'0{BITS_PER_COORD}b')
+        bits.extend(int(b) for b in yb + xb)
+    return bits
+
+def bits_to_coords(bits):
+    coords = []
+    for i in range(0, len(bits), 32):
+        y = int(''.join(map(str, bits[i:i+16])), 2)
+        x = int(''.join(map(str, bits[i+16:i+32])), 2)
+        coords.append((y, x))
+    return coords
+
+# === EMBEDDING === #
+def embed_lsb(image, bits, coords):
+    flat = image.flatten()
+    for i, (y, x) in enumerate(coords):
+        idx = y * image.shape[1] + x
+        flat[idx] = (flat[idx] & ~1) | bits[i]
+    return flat.reshape(image.shape)
+
+def embed_metadata(image, meta_bits):
+    flat = image.flatten()
+    for i in range(len(meta_bits)):
+        flat[i] = (flat[i] & ~1) | meta_bits[i]
+    return flat.reshape(image.shape)
+
+# === DECODING === #
+def decode_message_and_coords(image):
+    flat = image.flatten()
+    coord_bits = [flat[i] & 1 for i in range(RESERVED_BITS)]
+    coords = bits_to_coords(coord_bits)
+    msg_bits = [flat[y * image.shape[1] + x] & 1 for y, x in coords[:NUM_PIXELS]]
+    return bits_to_string(msg_bits), coords
+
+# === PRNG-BASED PIXEL SELECTION === #
 def generate_prng_pixel_positions(image_shape, count, seed_value):
     np.random.seed(seed_value)
     h, w = image_shape
     indices = np.random.choice(h * w, size=count, replace=False)
-    rows, cols = np.unravel_index(indices, (h, w))
-    return list(zip(rows, cols))
+    ys, xs = np.unravel_index(indices, (h, w))
+    return list(zip(ys, xs))
 
-def coords_to_bits(coords):
-    bit_list = []
-    for row, col in coords:
-        row_bits = format(row, f'0{bits_per_coord}b')
-        col_bits = format(col, f'0{bits_per_coord}b')
-        bit_list.extend(int(b) for b in row_bits + col_bits)
-    return bit_list
+# === MAIN PROCESSING FUNCTION === #
+def process_folder(input_folder, model_path, output_excel):
+    model = load_model(model_path)
+    results = []
 
-def bits_to_coords(bit_list):
-    coords = []
-    for i in range(0, len(bit_list), bits_per_coord * 2):
-        row_bits = bit_list[i:i+bits_per_coord]
-        col_bits = bit_list[i+bits_per_coord:i+bits_per_coord*2]
-        row = int(''.join(map(str, row_bits)), 2)
-        col = int(''.join(map(str, col_bits)), 2)
-        coords.append((row, col))
-    return coords
+    image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-def encode_bits_lsb(image_array, bit_values):
-    flat = image_array.flatten()
-    for i, bit in enumerate(bit_values):
-        flat[i] = (flat[i] & ~1) | bit
-    return flat.reshape(image_array.shape)
+    for idx, filename in enumerate(image_files):
+        print(f"[{idx + 1}/{len(image_files)}] Processing {filename}")
+        image_path = os.path.join(input_folder, filename)
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            print(f"⚠️ Could not read {filename}. Skipping.")
+            continue
 
-def decode_bits_lsb(image_array, num_bits):
-    flat = image_array.flatten()
-    return [flat[i] & 1 for i in range(num_bits)]
+        image = cv2.resize(image, IMG_SIZE)
+        norm_img = image.astype(np.float32) / 255.0
+        input_tensor = np.expand_dims(norm_img, axis=(0, -1))  # shape: (1, 128, 128, 1)
 
-# ---------------- Load CNN Model ---------------- #
-if not os.path.exists(model_path):
-    print("❌ CNN model not found!")
-    exit()
-model = load_model(model_path)
+        pred_probs = model.predict(input_tensor, verbose=0)[0]
+        label_index = int(np.argmax(pred_probs))
+        prng_pixels = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value=12345 + idx)
 
-# ---------------- Process Images ---------------- #
-image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg'))]
-results = []
+        # Generate a 24-bit message
+        original_msg = generate_random_message(chars=MESSAGE_BITS // 8)
 
-for idx, img_file in enumerate(image_files):
-    img_path = os.path.join(input_folder, img_file)
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        continue
+        # Convert message to bits
+        msg_bits = string_to_bits(original_msg)
 
-    # Generate PRNG coords and encode bits
-    img_shape = img.shape
-    prng_coords = generate_prng_pixel_positions(img_shape, prng_pixel_count, secret_seed + idx)
-    encoded_bits = coords_to_bits(prng_coords)
-    attacked_img = encode_bits_lsb(img, encoded_bits)
+        # Convert PRNG-selected coordinates to bits
+        coord_bits = coords_to_bits(prng_pixels)
 
-    # Save attacked image
-    save_path = os.path.join(attacked_folder, img_file)
-    cv2.imwrite(save_path, attacked_img)
+        # Embed the message in the image using LSB
+        msg_encoded_img = embed_lsb(image.copy(), msg_bits, prng_pixels)
 
-    # Prepare for CNN prediction (grayscale model)
-    resized = cv2.resize(attacked_img, img_input_size).astype(np.float32) / 255.0
-    input_img = np.expand_dims(resized, axis=(0, -1))  # Shape: (1, 128, 128, 1)
+        # Predict with CNN on the stego image
+        cnn_input = np.expand_dims(msg_encoded_img.astype(np.float32) / 255.0, axis=(0, -1))  # shape: (1, 128, 128, 1)
+        pred_probs_after_lsb = model.predict(cnn_input, verbose=0)[0]
+        pred_class_idx = int(np.argmax(pred_probs_after_lsb))
+        pred_class = CLASS_NAMES[pred_class_idx] if pred_class_idx < len(CLASS_NAMES) else 'Unknown'
+        confidence = float(pred_probs_after_lsb[pred_class_idx])
 
-    # CNN prediction
-    pred_prob = float(model.predict(input_img, verbose=0)[0][0])
-    pred_class = "Normal" if pred_prob > 0.5 else "Faulty"
+        # Embed the coordinates as metadata
+        final_stego = embed_metadata(msg_encoded_img, coord_bits)
 
-    # Decode LSB bits
-    decoded_bits = decode_bits_lsb(attacked_img, total_bits)
-    decoded_coords = bits_to_coords(decoded_bits)
+        # Decode the message and coordinates
+        decoded_msg, decoded_coords = decode_message_and_coords(final_stego)
 
-    # Compare bits
-    bit_match_count = sum(e == d for e, d in zip(encoded_bits, decoded_bits))
-    bit_match_percent = round((bit_match_count / total_bits) * 100, 2)
-    bit_match_result = "Match ✅" if bit_match_percent == 100.0 else "Mismatch ❌"
+        # Clean up the message for the Excel file
+        original_clean = clean_excel_string(original_msg)
+        decoded_clean = clean_excel_string(decoded_msg)
 
-    # Compare coords
-    coords_match = prng_coords == decoded_coords
-    coords_match_result = "Match ✅" if coords_match else "Mismatch ❌"
+        results.append({
+            "Image": filename,
+            "Original Message": original_clean,
+            "Decoded Message": decoded_clean,
+            "Match": "Matched" if original_clean == decoded_clean else "Mismatched",
+            "CNN Predicted Class": pred_class,
+            "Confidence": round(confidence, 4),
+            "Encoded Coords": str(prng_pixels),
+            "Decoded Coords Match": "Matched" if prng_pixels == decoded_coords else "Mismatched"
+        })
 
-    # Save all data
-    results.append({
-        "Image": img_file,
-        "Prediction": pred_class,
-        "Confidence": round(pred_prob, 4),
-        "Encoded Bits": str(encoded_bits),
-        "Decoded Bits": str(decoded_bits),
-        "Bit Match (%)": bit_match_percent,
-        "Message Match": bit_match_result,
-        "Original PRNG Coords": str(prng_coords),
-        "Decoded Coords": str(decoded_coords),
-        "Coords Match": coords_match_result
-    })
+    df = pd.DataFrame(results)
+    df.to_excel(output_excel, index=False)
+    print(f"\n✅ Done! Results saved to {output_excel}")
 
-# ---------------- Save to Excel ---------------- #
-df = pd.DataFrame(results)
-df.to_excel(output_excel, index=False)
-print(f"\n✅ Results saved to '{output_excel}' with full encoded messages.")
+    # === Visualization === #
+    sns.set(style="whitegrid")
+    df["True Label"] = "Normal"
+    cm = confusion_matrix(df["True Label"], df["CNN Predicted Class"], labels=CLASS_NAMES)
+
+    output_dir = os.path.dirname(output_excel)
+
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
+    plt.close()
+
+    plt.figure(figsize=(6, 4))
+    sns.countplot(data=df, x="Match")
+    plt.title("Message Match Count")
+    plt.ylabel("Number of Images")
+    plt.xlabel("Match Status")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "message_match_count.png"))
+    plt.close()
+
+    plt.figure(figsize=(6, 4))
+    sns.countplot(data=df, x="Decoded Coords Match")
+    plt.title("Coordinate Match Count")
+    plt.ylabel("Number of Images")
+    plt.xlabel("Coordinate Match Status")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "coordinate_match_count.png"))
+    plt.close()
+
+
+# === Run === #
+if __name__ == "__main__":
+    input_folder = "PRNG/FDIA 1/CNN/Images FDIA 1/Normal"
+    model_path = "PRNG/FDIA 1/CNN/cnn_2_class_model_grayscale.h5"
+    output_excel = "PRNG/FDIA 1/CNN/ig_layered_stego_results.xlsx"
+    process_folder(input_folder, model_path, output_excel)
