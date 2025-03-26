@@ -10,8 +10,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import confusion_matrix
 import matplotlib as mpl
 import joblib  # For loading Random Forest model
-from tf_keras_vis.saliency import Saliency
-from tf_keras_vis.utils.model_modifiers import ReplaceToLinear
 
 mpl.rcParams['font.family'] = 'DejaVu Sans'
 
@@ -76,6 +74,17 @@ def embed_metadata(image, meta_bits):
         flat[i] = (flat[i] & ~1) | meta_bits[i]
     return flat.reshape(image.shape)
 
+# === EMBEDDING SEED VALUE === #
+def seed_to_bits(seed_value, bits_per_seed=32):
+    # Convert the seed value to bits (32 bits by default)
+    return [int(b) for b in format(seed_value, f'0{bits_per_seed}b')]
+
+def embed_seed_value(image, seed_bits):
+    flat = image.flatten()
+    for i in range(len(seed_bits)):
+        flat[i] = (flat[i] & ~1) | seed_bits[i]
+    return flat.reshape(image.shape)
+
 # === DECODING === #
 def decode_message_and_coords(image):
     flat = image.flatten()
@@ -83,6 +92,13 @@ def decode_message_and_coords(image):
     coords = bits_to_coords(coord_bits)
     msg_bits = [flat[y * image.shape[1] + x] & 1 for y, x in coords[:NUM_PIXELS]]
     return bits_to_string(msg_bits), coords
+
+# === EXTRACTING SEED VALUE === #
+def extract_seed_value(image, bits_per_seed=32):
+    flat = image.flatten()
+    seed_bits = [flat[i] & 1 for i in range(bits_per_seed)]
+    seed_value = int(''.join(map(str, seed_bits)), 2)
+    return seed_value
 
 # === PRNG-BASED PIXEL SELECTION === #
 def generate_prng_pixel_positions(image_shape, count, seed_value):
@@ -125,7 +141,16 @@ def process_folder(input_folder, model_path, output_excel):
         # Map pred_class_idx back to class name
         pred_class = CLASS_NAMES[pred_class_idx]
 
-        prng_pixels = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value=12345 + idx)
+        # Generate the seed value for this image (e.g., 12345 + idx)
+        seed_value = 12345 + idx  # Unique seed for each image
+
+        # Convert seed to bits
+        seed_bits = seed_to_bits(seed_value)
+
+        # Embed the seed value in the image
+        msg_encoded_img_with_seed = embed_seed_value(image.copy(), seed_bits)
+
+        prng_pixels = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value=seed_value)
 
         # Generate a 24-bit message
         original_msg = generate_random_message(chars=MESSAGE_BITS // 8)
@@ -137,13 +162,16 @@ def process_folder(input_folder, model_path, output_excel):
         coord_bits = coords_to_bits(prng_pixels)
 
         # Embed the message in the image using LSB
-        msg_encoded_img = embed_lsb(image.copy(), msg_bits, prng_pixels)
+        msg_encoded_img_with_seed = embed_lsb(msg_encoded_img_with_seed, msg_bits, prng_pixels)
 
         # Embed the coordinates as metadata
-        final_stego = embed_metadata(msg_encoded_img, coord_bits)
+        final_stego_with_seed = embed_metadata(msg_encoded_img_with_seed, coord_bits)
 
         # Decode the message and coordinates
-        decoded_msg, decoded_coords = decode_message_and_coords(final_stego)
+        decoded_seed_value = extract_seed_value(final_stego_with_seed)
+        prng_pixels_decoded = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value=decoded_seed_value)
+
+        decoded_msg, decoded_coords = decode_message_and_coords(final_stego_with_seed)
 
         # Clean up the message for the Excel file
         original_clean = clean_excel_string(original_msg)
@@ -198,9 +226,9 @@ def process_folder(input_folder, model_path, output_excel):
     plt.savefig(os.path.join(output_dir, "coordinate_match_count.png"))
     plt.close()
 
-
+# === Run === #
 if __name__ == "__main__":
     input_folder = "PRNG/FDIA 1/RF/Images FDIA 1/Normal"
     model_path = "PRNG/FDIA 1/RF/rf_model.pkl"  # Path to your Random Forest model
-    output_excel = "PRNG/FDIA 1/RF/ig_layered_stego_results_rf.xlsx"
+    output_excel = "PRNG/FDIA 1/CNN/ig_layered_stego_results_rf_with_seed.xlsx"
     process_folder(input_folder, model_path, output_excel)
