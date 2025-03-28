@@ -7,27 +7,23 @@ import string
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
-import matplotlib as mpl
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tf_keras_vis.saliency import Saliency
 from tf_keras_vis.utils.model_modifiers import ReplaceToLinear
 
-mpl.rcParams['font.family'] = 'DejaVu Sans'
-
 # === CONFIGURATION === #
-IMG_SIZE = (128, 128)
-NUM_PIXELS = 40
+IMG_SIZE = (128, 128)  # Updated image size to 128x128
+NUM_PIXELS = 32  # Updated to 32 important pixels for a 4-letter message
 BITS_PER_COORD = 16
-RESERVED_BITS = NUM_PIXELS * BITS_PER_COORD * 2
-MESSAGE_BITS = NUM_PIXELS
+RESERVED_BITS = NUM_PIXELS * BITS_PER_COORD * 2  # For embedding coordinates of the top 32 pixels
+MESSAGE_BITS = 4 * 8  # 4-letter message, each letter is 8 bits (total of 32 bits)
 CHANNELS = 1
-CLASS_NAMES = ['Normal', 'Attack']
+CLASS_NAMES = ['Normal', 'Faulty']  # Updated to 2 classes
 
 # === MESSAGE UTILS === #
-def generate_random_message(bits=40):
-    chars = bits // 8
-    return ''.join(random.choices(string.ascii_letters, k=chars))
+def generate_random_message():
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=4))  # 4-letter message
 
 def string_to_bits(s):
     return [int(b) for c in s.encode('utf-8') for b in format(c, '08b')][:MESSAGE_BITS]
@@ -39,9 +35,6 @@ def bits_to_string(bits):
         if len(byte) == 8:
             chars.append(chr(int(''.join(map(str, byte)), 2)))
     return ''.join(chars)
-
-def clean_excel_string(s):
-    return ''.join(c for c in s if c.isalpha())
 
 # === COORDINATE CONVERSION === #
 def coords_to_bits(coords):
@@ -60,27 +53,32 @@ def bits_to_coords(bits):
         coords.append((y, x))
     return coords
 
+# === CLEANING FUNCTION FOR EXCEL === #
+def clean_message(s):
+    """
+    Clean message to remove illegal characters (non-printable characters).
+    """
+    return ''.join(c for c in s if c.isprintable())
+
 # === EMBEDDING === #
 def embed_lsb(image, bits, coords):
+    """
+    First layer: Embed the message (LSB) into the image.
+    """
     flat = image.flatten()
     for i, (y, x) in enumerate(coords):
         idx = y * image.shape[1] + x
-        flat[idx] = (flat[idx] & ~1) | bits[i]
+        flat[idx] = (flat[idx] & ~1) | bits[i]  # Modify LSB for message embedding
     return flat.reshape(image.shape)
 
 def embed_metadata(image, meta_bits):
+    """
+    Second layer: Embed coordinates or metadata into higher bit planes (e.g., 8th bit).
+    """
     flat = image.flatten()
     for i in range(len(meta_bits)):
-        flat[i] = (flat[i] & ~1) | meta_bits[i]
+        flat[i] = (flat[i] & ~(1 << 7)) | (meta_bits[i] << 7)  # Set bit 7 for coordinates (higher bit)
     return flat.reshape(image.shape)
-
-# === DECODING === #
-def decode_message_and_coords(image):
-    flat = image.flatten()
-    coord_bits = [flat[i] & 1 for i in range(RESERVED_BITS)]
-    coords = bits_to_coords(coord_bits)
-    msg_bits = [flat[y * image.shape[1] + x] & 1 for y, x in coords[:NUM_PIXELS]]
-    return bits_to_string(msg_bits), coords
 
 # === IG-BASED IMPORTANT PIXELS === #
 def get_ig_pixels(model, image_tensor, label_index, top_k=NUM_PIXELS):
@@ -91,9 +89,23 @@ def get_ig_pixels(model, image_tensor, label_index, top_k=NUM_PIXELS):
     if saliency_map.ndim == 3:
         saliency_map = np.mean(saliency_map, axis=-1)
     flat = saliency_map.flatten()
-    indices = np.argsort(flat)[-top_k:]
+    indices = np.argsort(flat)[-top_k:]  # Get the top k important pixels (now 32)
     ys, xs = np.unravel_index(indices, saliency_map.shape)
     return list(zip(ys, xs))
+
+# === DECODING === #
+def decode_message_and_coords(image):
+    flat = image.flatten()
+
+    # Extract coordinates from the higher bit plane (bit 7 for example)
+    coord_bits = [(flat[i] >> 7) & 1 for i in range(RESERVED_BITS)]  # Extract higher bit for coordinates
+    coords = bits_to_coords(coord_bits)  # Convert bits to coordinates
+
+    # Ensure that we extract 32 bits for the full message (4 letters * 8 bits each)
+    msg_bits = [flat[y * image.shape[1] + x] & 1 for y, x in coords[:NUM_PIXELS]]  # Extract LSB for message
+    
+    # Ensure that we are extracting the correct number of bits (32 for a 4-letter message)
+    return bits_to_string(msg_bits[:MESSAGE_BITS]), coords
 
 # === MAIN PROCESSING FUNCTION === #
 def process_folder(input_folder, model_path, output_excel):
@@ -101,6 +113,9 @@ def process_folder(input_folder, model_path, output_excel):
     results = []
 
     image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+    matched_count = 0
+    mismatched_count = 0
 
     for idx, filename in enumerate(image_files):
         print(f"[{idx + 1}/{len(image_files)}] Processing {filename}")
@@ -112,29 +127,55 @@ def process_folder(input_folder, model_path, output_excel):
 
         image = cv2.resize(image, IMG_SIZE)
         norm_img = image.astype(np.float32) / 255.0
-        input_tensor = np.expand_dims(norm_img, axis=(0, -1))
+        input_tensor = np.expand_dims(norm_img, axis=(0, -1))  # shape: (1, 128, 128, 1)
 
         pred_probs = model.predict(input_tensor, verbose=0)[0]
         label_index = int(np.argmax(pred_probs))
         ig_pixels = get_ig_pixels(model, input_tensor, label_index, top_k=NUM_PIXELS)
 
-        original_msg = generate_random_message()
+        # Encode a random 4-letter message
+        original_msg = generate_random_message()  # 4 letters
         msg_bits = string_to_bits(original_msg)
         coord_bits = coords_to_bits(ig_pixels)
-        msg_encoded_img = embed_lsb(image.copy(), msg_bits, ig_pixels)
 
-        cnn_input = np.expand_dims(msg_encoded_img.astype(np.float32) / 255.0, axis=(0, -1))
+        # Embed the message and the coordinates
+        msg_encoded_img = embed_lsb(image.copy(), msg_bits, ig_pixels)
+        cnn_input = np.expand_dims(msg_encoded_img.astype(np.float32) / 255.0, axis=(0, -1))  # shape: (1, 128, 128, 1)
+
+        # CNN Prediction after embedding the message
         pred_probs_after_lsb = model.predict(cnn_input, verbose=0)[0]
         pred_class_idx = int(np.argmax(pred_probs_after_lsb))
-        pred_class = CLASS_NAMES[pred_class_idx]
+        pred_class = CLASS_NAMES[pred_class_idx] if pred_class_idx < len(CLASS_NAMES) else 'Unknown'
         confidence = float(pred_probs_after_lsb[pred_class_idx])
 
+        # Embed metadata (coordinates) into the image
         final_stego = embed_metadata(msg_encoded_img, coord_bits)
+
+        # Decode the message and coordinates from the stego image
         decoded_msg, decoded_coords = decode_message_and_coords(final_stego)
 
-        original_clean = clean_excel_string(original_msg)
-        decoded_clean = clean_excel_string(decoded_msg)
+        # Clean the messages (for Excel storage)
+        original_clean = clean_message(original_msg)  # Clean original message
+        decoded_clean = clean_message(decoded_msg)  # Clean decoded message
 
+        # Print encoded and decoded message, and whether they match
+        print(f"Encoded Message: {original_clean}")
+        print(f"Decoded Message: {decoded_clean}")
+        print(f"Messages Match: {'Matched' if original_clean == decoded_clean else 'Mismatched'}\n")
+
+        # Count matched and mismatched messages
+        if original_clean == decoded_clean:
+            matched_count += 1
+        else:
+            mismatched_count += 1
+
+        # Extract True Label from folder name (e.g., "Normal", "Faulty")
+        true_label = os.path.basename(input_folder)  # Use basename to get the folder name directly
+        if true_label not in CLASS_NAMES:
+            print(f"Warning: '{true_label}' not found in CLASS_NAMES. Using 'Unknown' instead.")
+            true_label = 'Unknown'  # Default if label isn't found
+
+        # Store results for Excel
         results.append({
             "Image": filename,
             "Original Message": original_clean,
@@ -143,22 +184,28 @@ def process_folder(input_folder, model_path, output_excel):
             "CNN Predicted Class": pred_class,
             "Confidence": round(confidence, 4),
             "Encoded Coords": str(ig_pixels),
-            "Decoded Coords Match": "Matched" if ig_pixels == decoded_coords else "Mismatched"
+            "Decoded Coords Match": "Matched" if ig_pixels == decoded_coords else "Mismatched",
+            "True Label": true_label  # Add True Label to DataFrame
         })
 
+    # Save results to Excel
     df = pd.DataFrame(results)
     df.to_excel(output_excel, index=False)
     print(f"\n✅ Done! Results saved to {output_excel}")
 
+    # Print total matched and mismatched messages
+    print(f"\nTotal Matched Messages: {matched_count}")
+    print(f"Total Mismatched Messages: {mismatched_count}")
+
     # === Visualization === #
     sns.set(style="whitegrid")
-    df["True Label"] = df["Image"].apply(lambda x: "Normal" if "Normal" in x else "Attack")
-    cm = confusion_matrix(df["True Label"], df["CNN Predicted Class"], labels=["Normal", "Attack"])
+    cm = confusion_matrix(df["True Label"], df["CNN Predicted Class"], labels=CLASS_NAMES)
 
     output_dir = os.path.dirname(output_excel)
 
+    # Confusion Matrix Plot
     plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=["Normal", "Attack"], yticklabels=["Normal", "Attack"])
+    sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
     plt.title("Confusion Matrix")
@@ -166,6 +213,7 @@ def process_folder(input_folder, model_path, output_excel):
     plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
     plt.close()
 
+    # Message Match Count Plot
     plt.figure(figsize=(6, 4))
     sns.countplot(data=df, x="Match")
     plt.title("Message Match Count")
@@ -175,6 +223,7 @@ def process_folder(input_folder, model_path, output_excel):
     plt.savefig(os.path.join(output_dir, "message_match_count.png"))
     plt.close()
 
+    # Coordinate Match Count Plot
     plt.figure(figsize=(6, 4))
     sns.countplot(data=df, x="Decoded Coords Match")
     plt.title("Coordinate Match Count")
@@ -184,9 +233,11 @@ def process_folder(input_folder, model_path, output_excel):
     plt.savefig(os.path.join(output_dir, "coordinate_match_count.png"))
     plt.close()
 
+
+
 # === Run === #
 if __name__ == "__main__":
-    input_folder = "Layered IG LSB/CNN FDIA 1/Normal (FDIA 1)"
+    input_folder = "Layered IG LSB/CNN FDIA 1/Normal"
     model_path = "Layered IG LSB/CNN FDIA 1/cnn_2_class_model_grayscale.h5"
     output_excel = "Layered IG LSB/CNN FDIA 1/ig_layered_stego_results.xlsx"
     process_folder(input_folder, model_path, output_excel)
