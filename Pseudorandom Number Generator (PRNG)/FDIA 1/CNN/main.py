@@ -8,28 +8,27 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 import matplotlib as mpl
+import hashlib
 import tensorflow as tf
-from tensorflow.keras.models import load_model  # Use for loading CNN model
+from tensorflow.keras.models import load_model
 
 mpl.rcParams['font.family'] = 'DejaVu Sans'
 
 # === CONFIGURATION === #
-IMG_SIZE = (128, 128)  # Updated to 128x128 for the new CNN model
-NUM_PIXELS = 24  # Number of PRNG selected pixels for embedding
-BITS_PER_COORD = 16
-RESERVED_BITS = NUM_PIXELS * BITS_PER_COORD * 2  # Coordinate storage size
-MESSAGE_BITS = NUM_PIXELS  # 24 bits for message (3 characters)
+IMG_SIZE = (128, 128)
+NUM_PIXELS = 24
+MESSAGE_BITS = NUM_PIXELS
 CHANNELS = 1
-CLASS_NAMES = ['Normal', 'Attack']  # Updated for your CNN model's classes (Normal and Attack)
+CLASS_NAMES = ['Normal', 'Attack']
+SEED_MODE = 'hash'  # Options: 'hash' or 'random'
+RESERVED_PIXELS = 800
 
 # === MESSAGE UTILS === #
 def generate_random_message(chars=3):
-    # Generate a 3-character message with only alphabetic letters
-    return ''.join(random.choices(string.ascii_letters, k=chars))
+    return ''.join(random.choices(string.ascii_letters[:26] + string.ascii_letters[26:], k=chars))
 
 def string_to_bits(s):
-    # Convert the message into bits (24 bits for 3 characters)
-    return [int(b) for c in s.encode('utf-8') for b in format(c, '08b')][:MESSAGE_BITS]
+    return [int(b) for c in s.encode('ascii') for b in format(c, '08b')][:MESSAGE_BITS]
 
 def bits_to_string(bits):
     chars = []
@@ -40,43 +39,25 @@ def bits_to_string(bits):
     return ''.join(chars)
 
 def clean_excel_string(s):
-    # Clean the string to include only letters (no spaces, no numbers)
     return ''.join(c for c in s if c.isalpha())
-
-# === COORDINATE CONVERSION === #
-def coords_to_bits(coords):
-    bits = []
-    for y, x in coords:
-        yb = format(y, f'0{BITS_PER_COORD}b')
-        xb = format(x, f'0{BITS_PER_COORD}b')
-        bits.extend(int(b) for b in yb + xb)
-    return bits
-
-def bits_to_coords(bits):
-    coords = []
-    for i in range(0, len(bits), 32):
-        y = int(''.join(map(str, bits[i:i+16])), 2)
-        x = int(''.join(map(str, bits[i+16:i+32])), 2)
-        coords.append((y, x))
-    return coords
 
 # === EMBEDDING === #
 def embed_lsb(image, bits, coords):
     flat = image.flatten()
+    used_indices = set()
     for i, (y, x) in enumerate(coords):
+        if not (0 <= y < image.shape[0] and 0 <= x < image.shape[1]):
+            print(f"⚠️ Invalid coordinate: ({y}, {x})")
+            continue
         idx = y * image.shape[1] + x
+        if idx < RESERVED_PIXELS:
+            print(f"⚠️ Skipping reserved pixel at index {idx} (coord: {y}, {x})")
+            continue
         flat[idx] = (flat[idx] & ~1) | bits[i]
+        used_indices.add(idx)
     return flat.reshape(image.shape)
 
-def embed_metadata(image, meta_bits):
-    flat = image.flatten()
-    for i in range(len(meta_bits)):
-        flat[i] = (flat[i] & ~1) | meta_bits[i]
-    return flat.reshape(image.shape)
-
-# === EMBEDDING SEED VALUE === #
 def seed_to_bits(seed_value, bits_per_seed=32):
-    # Convert the seed value to bits (32 bits by default)
     return [int(b) for b in format(seed_value, f'0{bits_per_seed}b')]
 
 def embed_seed_value(image, seed_bits):
@@ -85,43 +66,53 @@ def embed_seed_value(image, seed_bits):
         flat[i] = (flat[i] & ~1) | seed_bits[i]
     return flat.reshape(image.shape)
 
-# === DECODING === #
-def decode_message_and_coords(image):
-    flat = image.flatten()
-    coord_bits = [flat[i] & 1 for i in range(RESERVED_BITS)]
-    coords = bits_to_coords(coord_bits)
-    msg_bits = [flat[y * image.shape[1] + x] & 1 for y, x in coords[:NUM_PIXELS]]
-    return bits_to_string(msg_bits), coords
-
-# === EXTRACTING SEED VALUE === #
 def extract_seed_value(image, bits_per_seed=32):
     flat = image.flatten()
     seed_bits = [flat[i] & 1 for i in range(bits_per_seed)]
     seed_value = int(''.join(map(str, seed_bits)), 2)
     return seed_value
 
-# === PRNG-BASED PIXEL SELECTION === #
+# === SEED GENERATORS === #
+def get_seed_from_filename(filename):
+    hash_digest = hashlib.md5(filename.encode()).hexdigest()
+    return int(hash_digest, 16) % (2**32)
+
+def get_random_seed():
+    return random.randint(0, 2**32 - 1)
+
+# === PRNG PIXEL SELECTION === #
 def generate_prng_pixel_positions(image_shape, count, seed_value):
     np.random.seed(seed_value)
     h, w = image_shape
-    indices = np.random.choice(h * w, size=count, replace=False)
+    total_pixels = h * w
+    excluded_pixels = set(range(RESERVED_PIXELS))
+    valid_indices = list(set(range(total_pixels)) - excluded_pixels)
+    indices = np.random.choice(valid_indices, size=count, replace=False)
     ys, xs = np.unravel_index(indices, (h, w))
     return list(zip(ys, xs))
 
-# === FEATURE EXTRACTION FOR CNN === #
+# === CNN FEATURE EXTRACTION === #
 def extract_features(image):
-    # CNN needs 4D input (batch size, height, width, channels)
-    image = np.expand_dims(image, axis=-1)  # Adding channels dimension (1 for grayscale)
-    image = np.expand_dims(image, axis=0)  # Adding batch dimension
+    image = np.expand_dims(image, axis=-1)
+    image = np.expand_dims(image, axis=0)
     return image
+
+# === DECODING === #
+def decode_message(image, coords):
+    flat = image.flatten()
+    msg_bits = [flat[y * image.shape[1] + x] & 1 for y, x in coords[:NUM_PIXELS]]
+    print(f"Decoded Message Bits: {msg_bits}")
+    return bits_to_string(msg_bits)
 
 # === MAIN PROCESSING FUNCTION === #
 def process_folder(input_folder, model_path, output_excel):
-    # Load CNN model (instead of RF)
-    model = load_model(model_path)  # Assuming the CNN model is saved as a .h5 file
+    model = load_model(model_path)
     results = []
-
     image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+    # Initialize counters for matched and mismatched messages
+    matched_count = 0
+    mismatched_count = 0
 
     for idx, filename in enumerate(image_files):
         print(f"[{idx + 1}/{len(image_files)}] Processing {filename}")
@@ -132,74 +123,75 @@ def process_folder(input_folder, model_path, output_excel):
             continue
 
         image = cv2.resize(image, IMG_SIZE)
-        
-        # Feature extraction for CNN
-        cnn_input = extract_features(image)
+        image = image.astype(np.uint8)
 
-        # Predict with CNN
-        pred_probs = model.predict(cnn_input, verbose=0)[0]
-        pred_class_idx = int(np.argmax(pred_probs))  # Get the predicted class index
-        confidence = float(pred_probs[pred_class_idx])  # Confidence score
+        if SEED_MODE == 'hash':
+            seed_value = get_seed_from_filename(filename)
+        elif SEED_MODE == 'random':
+            seed_value = get_random_seed()
+        else:
+            raise ValueError("Invalid SEED_MODE. Choose 'hash' or 'random'.")
 
-        # Map pred_class_idx back to class name
-        pred_class = CLASS_NAMES[pred_class_idx]
+        print(f"Encoded Seed: {seed_value}")
 
-        # Generate the seed value for this image (e.g., 12345 + idx)
-        seed_value = 12345 + idx  # Unique seed for each image
-
-        # Convert seed to bits
         seed_bits = seed_to_bits(seed_value)
-
-        # Embed the seed value in the image
-        msg_encoded_img_with_seed = embed_seed_value(image.copy(), seed_bits)
+        stego_img = embed_seed_value(image.copy(), seed_bits)
 
         prng_pixels = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value=seed_value)
-
-        # Generate a 24-bit message
         original_msg = generate_random_message(chars=MESSAGE_BITS // 8)
-
-        # Convert message to bits
         msg_bits = string_to_bits(original_msg)
+        print(f"Original Message Bits: {msg_bits}")
 
-        # Convert PRNG-selected coordinates to bits
-        coord_bits = coords_to_bits(prng_pixels)
+        final_stego = embed_lsb(stego_img.copy(), msg_bits, prng_pixels)
 
-        # Embed the message in the image using LSB
-        msg_encoded_img_with_seed = embed_lsb(msg_encoded_img_with_seed, msg_bits, prng_pixels)
+        # === CNN Prediction BEFORE decoding === #
+        cnn_input = extract_features(final_stego)
+        pred_probs = model.predict(cnn_input, verbose=0)[0]
+        pred_class_idx = int(np.argmax(pred_probs))
+        pred_class = CLASS_NAMES[pred_class_idx]
+        confidence = float(pred_probs[pred_class_idx])
 
-        # Embed the coordinates as metadata
-        final_stego_with_seed = embed_metadata(msg_encoded_img_with_seed, coord_bits)
+        # === Now Decode Message AFTER CNN === #
+        decoded_seed_value = extract_seed_value(final_stego)
+        print(f"Decoded Seed: {decoded_seed_value}")
 
-        # Decode the message and coordinates
-        decoded_seed_value = extract_seed_value(final_stego_with_seed)
         prng_pixels_decoded = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value=decoded_seed_value)
+        decoded_msg = decode_message(final_stego, prng_pixels_decoded)
 
-        decoded_msg, decoded_coords = decode_message_and_coords(final_stego_with_seed)
-
-        # Clean up the message for the Excel file
         original_clean = clean_excel_string(original_msg)
         decoded_clean = clean_excel_string(decoded_msg)
+
+        match_status = "Matched" if original_clean == decoded_clean else "Mismatched"
+        print(f"Original Message: {original_clean} | Decoded Message: {decoded_clean} => {match_status}")
+
+        # Increment the counters based on whether the messages match
+        if match_status == "Matched":
+            matched_count += 1
+        else:
+            mismatched_count += 1
 
         results.append({
             "Image": filename,
             "Original Message": original_clean,
             "Decoded Message": decoded_clean,
-            "Match": "Matched" if original_clean == decoded_clean else "Mismatched",
+            "Match": match_status,
             "CNN Predicted Class": pred_class,
             "Confidence": round(confidence, 4),
-            "Encoded Coords": str(prng_pixels),
-            "Decoded Coords Match": "Matched" if prng_pixels == decoded_coords else "Mismatched"
+            "Seed": seed_value
         })
 
     df = pd.DataFrame(results)
     df.to_excel(output_excel, index=False)
     print(f"\n✅ Done! Results saved to {output_excel}")
 
+    # Print total matched and mismatched messages
+    print(f"\nTotal Matched Messages: {matched_count}")
+    print(f"Total Mismatched Messages: {mismatched_count}")
+
     # === Visualization === #
     sns.set(style="whitegrid")
-    df["True Label"] = "Normal"  # Assuming the true labels are always "Normal"
+    df["True Label"] = "Normal"
     cm = confusion_matrix(df["True Label"], df["CNN Predicted Class"], labels=CLASS_NAMES)
-
     output_dir = os.path.dirname(output_excel)
 
     plt.figure(figsize=(6, 5))
@@ -220,20 +212,9 @@ def process_folder(input_folder, model_path, output_excel):
     plt.savefig(os.path.join(output_dir, "message_match_count.png"))
     plt.close()
 
-    plt.figure(figsize=(6, 4))
-    sns.countplot(data=df, x="Decoded Coords Match")
-    plt.title("Coordinate Match Count")
-    plt.ylabel("Number of Images")
-    plt.xlabel("Coordinate Match Status")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "coordinate_match_count.png"))
-    plt.close()
 
-# === Run === #
 if __name__ == "__main__":
     input_folder = "PRNG/FDIA 1/CNN/Images FDIA 1/Normal"
     model_path = "PRNG/FDIA 1/CNN/cnn_2_class_model_grayscale.h5"  # Path to your CNN model (.h5 file)
     output_excel = "PRNG/FDIA 1/CNN/ig_layered_stego_results_cnn_with_seed.xlsx"
     process_folder(input_folder, model_path, output_excel)
-
-
