@@ -11,6 +11,9 @@ import matplotlib as mpl
 import hashlib
 import tensorflow as tf
 from tensorflow.keras.models import load_model
+from skimage.metrics import structural_similarity as ssim
+from scipy.fftpack import dct
+import math
 
 mpl.rcParams['font.family'] = 'DejaVu Sans'
 
@@ -20,8 +23,9 @@ NUM_PIXELS = 24
 MESSAGE_BITS = NUM_PIXELS
 CHANNELS = 1
 CLASS_NAMES = ['Normal', 'Attack']
-SEED_MODE = 'hash'  # Options: 'hash' or 'random'
-RESERVED_PIXELS = 800
+SEED_MODE = 'hash'
+SEED_RESERVED_PIXELS = 300
+SEED_SECRET_KEY = "my_shared_passphrase"
 
 # === MESSAGE UTILS === #
 def generate_random_message(chars=3):
@@ -41,51 +45,63 @@ def bits_to_string(bits):
 def clean_excel_string(s):
     return ''.join(c for c in s if c.isalpha())
 
+# === PRNG SEED-HIDING BASED ON IMAGE CONTENT + SHARED KEY === #
+def get_seed_hiding_key(secret_key: str, image: np.ndarray):
+    image_hash = hashlib.sha256(image.tobytes()).hexdigest()
+    combined = secret_key + image_hash
+    digest = hashlib.sha256(combined.encode()).hexdigest()
+    return int(digest, 16) % (2**32)
+
 # === EMBEDDING === #
 def embed_lsb(image, bits, coords):
     flat = image.flatten()
     used_indices = set()
     for i, (y, x) in enumerate(coords):
         if not (0 <= y < image.shape[0] and 0 <= x < image.shape[1]):
-            print(f"⚠️ Invalid coordinate: ({y}, {x})")
             continue
         idx = y * image.shape[1] + x
-        if idx < RESERVED_PIXELS:
-            print(f"⚠️ Skipping reserved pixel at index {idx} (coord: {y}, {x})")
+        if idx < SEED_RESERVED_PIXELS:
             continue
         flat[idx] = (flat[idx] & ~1) | bits[i]
         used_indices.add(idx)
     return flat.reshape(image.shape)
 
-def seed_to_bits(seed_value, bits_per_seed=32):
-    return [int(b) for b in format(seed_value, f'0{bits_per_seed}b')]
+# === PRNG Seed Embedding === #
+def get_seed_embedding_coords(image, total_reserved=SEED_RESERVED_PIXELS, bits=32, seed_secret_key=SEED_SECRET_KEY):
+    seed_key = get_seed_hiding_key(seed_secret_key, image)
+    np.random.seed(seed_key)
+    coords = np.random.choice(range(total_reserved), size=bits, replace=False)
+    return coords
 
-def embed_seed_value(image, seed_bits):
+def embed_seed_value(image, seed_bits, seed_secret_key, coords=None):
+    if coords is None:
+        coords = get_seed_embedding_coords(image.copy(), seed_secret_key=seed_secret_key)
     flat = image.flatten()
-    for i in range(len(seed_bits)):
-        flat[i] = (flat[i] & ~1) | seed_bits[i]
-    return flat.reshape(image.shape)
+    for i, idx in enumerate(coords):
+        flat[idx] = (flat[idx] & ~1) | seed_bits[i]
+    return flat.reshape(image.shape), coords
 
-def extract_seed_value(image, bits_per_seed=32):
+def extract_seed_value(image, seed_secret_key, coords=None):
+    if coords is None:
+        coords = get_seed_embedding_coords(image.copy(), seed_secret_key=seed_secret_key)
     flat = image.flatten()
-    seed_bits = [flat[i] & 1 for i in range(bits_per_seed)]
+    seed_bits = [flat[idx] & 1 for idx in coords]
     seed_value = int(''.join(map(str, seed_bits)), 2)
     return seed_value
 
 # === SEED GENERATORS === #
-def get_seed_from_filename(filename):
-    hash_digest = hashlib.md5(filename.encode()).hexdigest()
-    return int(hash_digest, 16) % (2**32)
-
-def get_random_seed():
-    return random.randint(0, 2**32 - 1)
+def get_seed_from_image(secret_key: str, image: np.ndarray):
+    image_hash = hashlib.sha256(image.tobytes()).hexdigest()
+    combined = secret_key + image_hash + "_main_seed"
+    digest = hashlib.sha256(combined.encode()).hexdigest()
+    return int(digest, 16) % (2**32)
 
 # === PRNG PIXEL SELECTION === #
 def generate_prng_pixel_positions(image_shape, count, seed_value):
     np.random.seed(seed_value)
     h, w = image_shape
     total_pixels = h * w
-    excluded_pixels = set(range(RESERVED_PIXELS))
+    excluded_pixels = set(range(SEED_RESERVED_PIXELS))
     valid_indices = list(set(range(total_pixels)) - excluded_pixels)
     indices = np.random.choice(valid_indices, size=count, replace=False)
     ys, xs = np.unravel_index(indices, (h, w))
@@ -93,6 +109,7 @@ def generate_prng_pixel_positions(image_shape, count, seed_value):
 
 # === CNN FEATURE EXTRACTION === #
 def extract_features(image):
+    image = image.astype(np.float32) / 255.0
     image = np.expand_dims(image, axis=-1)
     image = np.expand_dims(image, axis=0)
     return image
@@ -101,120 +118,152 @@ def extract_features(image):
 def decode_message(image, coords):
     flat = image.flatten()
     msg_bits = [flat[y * image.shape[1] + x] & 1 for y, x in coords[:NUM_PIXELS]]
-    print(f"Decoded Message Bits: {msg_bits}")
     return bits_to_string(msg_bits)
 
-# === MAIN PROCESSING FUNCTION === #
-def process_folder(input_folder, model_path, output_excel):
+# === CNN ANALYSIS === #
+def analyze_with_cnn(stego_image, model):
+    cnn_input = extract_features(stego_image)
+    prediction = model.predict(cnn_input, verbose=0)[0]
+    class_index = int(np.argmax(prediction))
+    predicted_class = CLASS_NAMES[class_index]
+    confidence = float(prediction[class_index])
+    return predicted_class, confidence
+
+# === IMAGE QUALITY METRICS === #
+def calculate_mse(original, stego):
+    return np.mean((original.astype(np.float32) - stego.astype(np.float32)) ** 2)
+
+def calculate_psnr(mse, max_pixel=255.0):
+    if mse == 0:
+        return float('inf')
+    return 20 * math.log10(max_pixel / math.sqrt(mse))
+
+def calculate_ssim(original, stego):
+    return ssim(original, stego)
+
+def compute_dct_difference(original, stego):
+    original_dct = dct(dct(original.T, norm='ortho').T, norm='ortho')
+    stego_dct = dct(dct(stego.T, norm='ortho').T, norm='ortho')
+    diff = np.abs(original_dct - stego_dct)
+    return np.mean(diff), np.max(diff)
+
+# === MAIN FUNCTION === #
+def process_folder(input_folder, model_path, stego_output_folder, results_output_folder, seed_secret_key):
     model = load_model(model_path)
     results = []
+
+    if not os.path.exists(stego_output_folder):
+        os.makedirs(stego_output_folder)
+
     image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-    # Initialize counters for matched and mismatched messages
-    matched_count = 0
-    mismatched_count = 0
-
-    for idx, filename in enumerate(image_files):
-        print(f"[{idx + 1}/{len(image_files)}] Processing {filename}")
+    for filename in image_files:
+        print(f"Processing: {filename}")
         image_path = os.path.join(input_folder, filename)
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            print(f"⚠️ Could not read {filename}. Skipping.")
-            continue
-
         image = cv2.resize(image, IMG_SIZE)
         image = image.astype(np.uint8)
 
-        if SEED_MODE == 'hash':
-            seed_value = get_seed_from_filename(filename)
-        elif SEED_MODE == 'random':
-            seed_value = get_random_seed()
-        else:
-            raise ValueError("Invalid SEED_MODE. Choose 'hash' or 'random'.")
+        seed_value = get_seed_from_image(seed_secret_key, image)
+        seed_bits = [int(b) for b in format(seed_value, '032b')]
 
-        print(f"Encoded Seed: {seed_value}")
+        stego_img, seed_coords = embed_seed_value(image.copy(), seed_bits, seed_secret_key)
+        extracted_seed = extract_seed_value(stego_img, seed_secret_key, coords=seed_coords)
+        key_match_status = "Matched" if extracted_seed == seed_value else "Mismatched"
 
-        seed_bits = seed_to_bits(seed_value)
-        stego_img = embed_seed_value(image.copy(), seed_bits)
-
-        prng_pixels = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value=seed_value)
-        original_msg = generate_random_message(chars=MESSAGE_BITS // 8)
+        prng_pixels = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value)
+        original_msg = generate_random_message(chars=3)
         msg_bits = string_to_bits(original_msg)
-        print(f"Original Message Bits: {msg_bits}")
-
         final_stego = embed_lsb(stego_img.copy(), msg_bits, prng_pixels)
 
-        # === CNN Prediction BEFORE decoding === #
-        cnn_input = extract_features(final_stego)
-        pred_probs = model.predict(cnn_input, verbose=0)[0]
-        pred_class_idx = int(np.argmax(pred_probs))
-        pred_class = CLASS_NAMES[pred_class_idx]
-        confidence = float(pred_probs[pred_class_idx])
+        decoded_msg = decode_message(final_stego, prng_pixels)
+        msg_match_status = "Matched" if clean_excel_string(decoded_msg) == clean_excel_string(original_msg) else "Mismatched"
 
-        # === Now Decode Message AFTER CNN === #
-        decoded_seed_value = extract_seed_value(final_stego)
-        print(f"Decoded Seed: {decoded_seed_value}")
+        pred_class, confidence = analyze_with_cnn(final_stego, model)
 
-        prng_pixels_decoded = generate_prng_pixel_positions(image.shape, NUM_PIXELS, seed_value=decoded_seed_value)
-        decoded_msg = decode_message(final_stego, prng_pixels_decoded)
+        stego_image_filename = f"stego_{filename}"
+        stego_image_path = os.path.join(stego_output_folder, stego_image_filename)
+        cv2.imwrite(stego_image_path, final_stego)
 
-        original_clean = clean_excel_string(original_msg)
-        decoded_clean = clean_excel_string(decoded_msg)
-
-        match_status = "Matched" if original_clean == decoded_clean else "Mismatched"
-        print(f"Original Message: {original_clean} | Decoded Message: {decoded_clean} => {match_status}")
-
-        # Increment the counters based on whether the messages match
-        if match_status == "Matched":
-            matched_count += 1
-        else:
-            mismatched_count += 1
+        mse_value = calculate_mse(image, final_stego)
+        psnr_value = calculate_psnr(mse_value)
+        ssim_value = calculate_ssim(image, final_stego)
+        mean_dct_diff, max_dct_diff = compute_dct_difference(image, final_stego)
 
         results.append({
             "Image": filename,
-            "Original Message": original_clean,
-            "Decoded Message": decoded_clean,
-            "Match": match_status,
+            "Original Message": original_msg,
+            "Decoded Message": decoded_msg,
+            "Message Match": msg_match_status,
+            "Seed": seed_value,
+            "Extracted Seed": extracted_seed,
+            "Key Match": key_match_status,
             "CNN Predicted Class": pred_class,
-            "Confidence": round(confidence, 4),
-            "Seed": seed_value
+            "Confidence": confidence,
+            "Stego Image Path": stego_image_path,
+            "MSE": round(mse_value, 4),
+            "PSNR": round(psnr_value, 2),
+            "SSIM": round(ssim_value, 4),
+            "Mean DCT Diff": round(mean_dct_diff, 4),
+            "Max DCT Diff": round(max_dct_diff, 4)
         })
 
     df = pd.DataFrame(results)
-    df.to_excel(output_excel, index=False)
-    print(f"\n✅ Done! Results saved to {output_excel}")
 
-    # Print total matched and mismatched messages
-    print(f"\nTotal Matched Messages: {matched_count}")
-    print(f"Total Mismatched Messages: {mismatched_count}")
+    avg_metrics = {
+        "Image": "AVERAGE",
+        "MSE": df["MSE"].mean(),
+        "PSNR": df["PSNR"].mean(),
+        "SSIM": df["SSIM"].mean(),
+        "Mean DCT Diff": df["Mean DCT Diff"].mean(),
+        "Max DCT Diff": df["Max DCT Diff"].mean()
+    }
 
-    # === Visualization === #
-    sns.set(style="whitegrid")
-    df["True Label"] = "Normal"
-    cm = confusion_matrix(df["True Label"], df["CNN Predicted Class"], labels=CLASS_NAMES)
-    output_dir = os.path.dirname(output_excel)
+    if "True Label" not in df.columns:
+        df["True Label"] = "Normal"
+
+    df_filtered = df[df["Image"] != "AVERAGE"]
+    cm = confusion_matrix(df_filtered["True Label"], df_filtered["CNN Predicted Class"], labels=CLASS_NAMES)
+
+    output_excel = os.path.join(results_output_folder, "stego_analysis_results_with_metrics.xlsx")
+    with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+        df_filtered.to_excel(writer, index=False, sheet_name="Per Image Results")
+        pd.DataFrame([avg_metrics]).to_excel(writer, index=False, sheet_name="Summary Averages")
 
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
-    plt.title("Confusion Matrix")
+    plt.title("Confusion Matrix for Stego Images")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
+    plt.savefig(os.path.join(results_output_folder, "stego_confusion_matrix.png"))
     plt.close()
 
     plt.figure(figsize=(6, 4))
-    sns.countplot(data=df, x="Match")
-    plt.title("Message Match Count")
+    sns.countplot(data=df, x="Key Match")
+    plt.title("Seed Match Count (Initial PRNG)")
     plt.ylabel("Number of Images")
-    plt.xlabel("Match Status")
+    plt.xlabel("Key Match Status")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "message_match_count.png"))
+    plt.savefig(os.path.join(results_output_folder, "initial_prng_key_match_count.png"))
     plt.close()
 
+    plt.figure(figsize=(6, 4))
+    sns.countplot(data=df, x="Message Match")
+    plt.title("Message Match Count (Second PRNG)")
+    plt.ylabel("Number of Images")
+    plt.xlabel("Message Match Status")
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_output_folder, "second_prng_message_match_count.png"))
+    plt.close()
 
-if __name__ == "__main__":
-    input_folder = "PRNG/FDIA 1/CNN/Images FDIA 1/Normal"
-    model_path = "PRNG/FDIA 1/CNN/cnn_2_class_model_grayscale.h5"  # Path to your CNN model (.h5 file)
-    output_excel = "PRNG/FDIA 1/CNN/ig_layered_stego_results_cnn_with_seed.xlsx"
-    process_folder(input_folder, model_path, output_excel)
+    print(f"\u2705 All results saved to: {results_output_folder}")
+
+# === RUN === #
+input_folder = "PRNG/FDIA 1/CNN/Images FDIA 1/Normal"
+model_path = "PRNG/FDIA 1/CNN/cnn_2_class_model_grayscale.h5"
+stego_output_folder = "PRNG/FDIA 1/CNN/Double PRNG/stego_images"
+results_output_folder = "PRNG/FDIA 1/CNN/Double PRNG"
+seed_secret_key = "Gustavo_Sanchez"
+
+process_folder(input_folder, model_path, stego_output_folder, results_output_folder, seed_secret_key)
