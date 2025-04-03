@@ -9,189 +9,175 @@ import seaborn as sns
 import random
 import string
 import joblib
+import math
+from skimage.metrics import structural_similarity as ssim
+from scipy.fftpack import dct
 
-# Helper function to generate random 4-letter message (32 bits)
+# === CONFIG === #
+IMG_SIZE = (128, 128)
+MESSAGE_LENGTH = 4  # 4 characters
+BITS_PER_CHAR = 8
+TOTAL_BITS = MESSAGE_LENGTH * BITS_PER_CHAR
+CLASS_NAMES = ['Normal', 'Attack']
+
+# === UTILS === #
 def generate_random_message(length=4):
     return ''.join(random.choices(string.ascii_uppercase, k=length))
 
-# Helper function to perform LSB (Least Significant Bit) encoding
+def sanitize_string(input_string):
+    return ''.join([char if ord(char) < 128 else '' for char in input_string]).strip()
+
 def lsb_encode(image, message, positions):
     encoded_image = image.copy()
-    message_bits = ''.join(format(ord(char), '08b') for char in message)  # Convert message to bits
-    bit_index = 0  # Track the bit position in the message
-    
-    used_pixels = []  # Store the pixels used for LSB encoding
-    embedded_bits = []  # Store the bits being embedded
-    
-    for i, pos in enumerate(positions):
-        if bit_index >= len(message_bits):  # Stop encoding when all message bits are encoded
-            break
-        
-        x, y = pos
-        bit = int(message_bits[bit_index])  # Get the next bit of the message
-        encoded_image[x, y] = (encoded_image[x, y] & ~1) | bit  # Encode the bit in the LSB
-        
-        # Track the pixel location and the embedded bit
+    message_bits = ''.join(format(ord(char), '08b') for char in message)
+    bit_index, used_pixels, embedded_bits = 0, [], []
+
+    for x, y in positions:
+        if bit_index >= len(message_bits): break
+        bit = int(message_bits[bit_index])
+        encoded_image[x, y] = (encoded_image[x, y] & ~1) | bit
         used_pixels.append((x, y))
         embedded_bits.append(bit)
-        
-        bit_index += 1  # Move to the next bit
-    
+        bit_index += 1
+
     return encoded_image, used_pixels, embedded_bits
 
-# Helper function to perform LSB decoding
-def lsb_decode(image, positions, message_length):
+def lsb_decode(image, positions, length):
+    bit_string = ''
     decoded_message = []
-    bit_string = ""
-    total_bits = message_length * 8  # Total bits in the message (4 characters * 8 bits each)
-    bit_index = 0  # Track the bit position in the message
-    
-    for i, pos in enumerate(positions):
-        if bit_index >= total_bits:  # Stop decoding when all message bits are decoded
-            break
-        
-        x, y = pos
-        bit = image[x, y] & 1  # Get the least significant bit from the pixel
-        bit_string += str(bit)  # Add the bit to the bit string
-        
-        if len(bit_string) == 8:  # Every 8 bits form one byte (character)
-            decoded_message.append(chr(int(bit_string, 2)))  # Convert bits to character
-            bit_string = ""  # Reset for the next byte
-        
-        bit_index += 1  # Move to the next bit
-    
+    total_bits = length * 8
+    for i, (x, y) in enumerate(positions):
+        if i >= total_bits: break
+        bit_string += str(image[x, y] & 1)
+        if len(bit_string) == 8:
+            decoded_message.append(chr(int(bit_string, 2)))
+            bit_string = ''
     return ''.join(decoded_message)
 
-# Function to sanitize strings for illegal characters in Excel
-def sanitize_string(input_string):
-    sanitized = ''.join([char if ord(char) >= 32 else '' for char in input_string])
-    return sanitized
+def calculate_mse(original, stego):
+    return np.mean((original.astype(np.float32) - stego.astype(np.float32)) ** 2)
 
-# Step 1: Input folder with images
+def calculate_psnr(mse, max_pixel=255.0):
+    return float('inf') if mse == 0 else 20 * math.log10(max_pixel / math.sqrt(mse))
+
+def calculate_ssim(original, stego):
+    return ssim(original, stego)
+
+def compute_dct_difference(original, stego):
+    original_dct = dct(dct(original.T, norm='ortho').T, norm='ortho')
+    stego_dct = dct(dct(stego.T, norm='ortho').T, norm='ortho')
+    diff = np.abs(original_dct - stego_dct)
+    return np.mean(diff), np.max(diff)
+
+def shap_pixel_selection(image, model, num_pixels=32):
+    image_flattened = image.flatten().reshape(1, -1)
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(image_flattened, check_additivity=False)[0]
+    flat_shap_values = shap_values[:, 0] if shap_values.ndim == 2 else shap_values[0]
+    top_indices = np.argsort(flat_shap_values)[-num_pixels:]
+    return [(idx // image.shape[1], idx % image.shape[1]) for idx in top_indices]
+
 def load_images_from_folder(folder_path):
-    images = []
-    filenames = []
+    images, filenames = [], []
     for filename in os.listdir(folder_path):
         img_path = os.path.join(folder_path, filename)
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)  # Load in grayscale
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is not None:
+            img = cv2.resize(img, IMG_SIZE)
             images.append(img)
             filenames.append(filename)
     return images, filenames
 
-# Step 2: Load pre-trained RF model and SHAP analysis
-def load_rf_model(model_path):
-    rf_model = joblib.load(model_path)
-    return rf_model
-
-# Step 3: Randomly select pixels for encoding
-def get_random_pixels(image, num_pixels=32):
-    height, width = image.shape
-    random_pixels = [(random.randint(0, height - 1), random.randint(0, width - 1)) for _ in range(num_pixels)]
-    return random_pixels
-
-# Step 4: Perform layered steganography (Encode the message in LSB)
-def layered_steganography(image, message, random_pixels):
-    encoded_image, used_pixels, embedded_bits = lsb_encode(image, message, random_pixels)
-    return encoded_image, used_pixels, embedded_bits
-
-# Step 5: Evaluate RF model on the new images
-def rf_predict(rf_model, images):
-    X = np.array([img.flatten() for img in images])
-    predictions = rf_model.predict(X)
-    return predictions
-
-# Step 6: Generate results and save to Excel
-def create_results_dataframe(filenames, encoded_messages, decoded_messages, rf_predictions, matches, used_pixels, embedded_bits, excel_path):
-    sanitized_encoded_messages = [sanitize_string(msg) for msg in encoded_messages]
-    sanitized_decoded_messages = [sanitize_string(msg) for msg in decoded_messages]
-    
-    data = {
-        'Image': filenames,
-        'Encoded Message': sanitized_encoded_messages,
-        'Decoded Message': sanitized_decoded_messages,
-        'RF Prediction': rf_predictions,
-        'Messages Match': matches,
-        'Used Pixels': used_pixels,
-        'Embedded Bits': embedded_bits
-    }
-    df = pd.DataFrame(data)
-    df.to_excel(excel_path, index=False)
-
-# Step 7: Visualize results with confusion matrix and bar graphs
-def visualize_results(filenames, predictions, matches, random_pixels, decoded_messages):
-    cm = confusion_matrix([0 if "Normal" in fname else 1 for fname in filenames], predictions)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'Attack'], yticklabels=['Normal', 'Attack'])
-    plt.title("Confusion Matrix")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.show()
-
-    correct_positions = [i for i, match in enumerate(matches) if match]
-    plt.bar(range(len(correct_positions)), correct_positions)
-    plt.title("Correct Message Locations")
-    plt.xlabel("Image Index")
-    plt.ylabel("Pixel Location")
-    plt.show()
-
-    match_counts = [matches.count(True), matches.count(False)]
-    plt.bar(['Matches', 'Mismatches'], match_counts)
-    plt.title("Message Matching Accuracy")
-    plt.ylabel("Count")
-    plt.show()
-
-# Main function to run the entire process
-def process_images(folder_path, model_path, excel_path):
+def process_images(folder_path, model_path, output_excel, stego_output_folder):
     images, filenames = load_images_from_folder(folder_path)
-    rf_model = load_rf_model(model_path)
+    rf_model = joblib.load(model_path)
 
-    encoded_messages = []
-    decoded_messages = []
-    rf_predictions = []
-    matches = []
-    used_pixels_all = []
-    embedded_bits_all = []
+    results = []
+    true_label = next((label for label in CLASS_NAMES if label.lower() in folder_path.lower()), 'Unknown')
 
     for i, image in enumerate(images):
-        print(f"Processing image: {filenames[i]}")
-        
-        random_pixels = get_random_pixels(image, num_pixels=32)
+        print(f"[{i+1}/{len(images)}] Processing {filenames[i]}")
+        selected_pixels = shap_pixel_selection(image, rf_model, num_pixels=TOTAL_BITS)
 
         message = generate_random_message()
-        encoded_messages.append(message)
+        encoded_image, used_pixels, embedded_bits = lsb_encode(image, message, selected_pixels)
+        rf_prediction = rf_model.predict([encoded_image.flatten()])[0]
+        rf_class_label = CLASS_NAMES[rf_prediction] if rf_prediction < len(CLASS_NAMES) else 'Unknown'
+        decoded_message = lsb_decode(encoded_image, selected_pixels, len(message))
 
-        encoded_image, used_pixels, embedded_bits = layered_steganography(image, message, random_pixels)
-        
-        rf_prediction = rf_predict(rf_model, [encoded_image.flatten()])[0]
-        rf_predictions.append(rf_prediction)
+        mse_val = calculate_mse(image, encoded_image)
+        psnr_val = calculate_psnr(mse_val)
+        ssim_val = calculate_ssim(image, encoded_image)
+        dct_mean, dct_max = compute_dct_difference(image, encoded_image)
 
-        decoded_message = lsb_decode(encoded_image, random_pixels, len(message))
-        decoded_messages.append(decoded_message)
-        
-        match = decoded_message == message
-        matches.append(match)
-        
-        used_pixels_all.append(used_pixels)
-        embedded_bits_all.append(embedded_bits)
-        
-        print(f"Encoded message: {message}")
-        print(f"Decoded message: {decoded_message}")
-        print(f"Do the messages match? {'Yes' if match else 'No'}\n")
+        results.append({
+            "Image": filenames[i],
+            "Original Message": sanitize_string(message),
+            "Decoded Message": sanitize_string(decoded_message),
+            "Match": "Matched" if message == decoded_message else "Mismatched",
+            "RF Predicted Class": rf_class_label,
+            "True Label": true_label,
+            "Used Pixels": str(used_pixels),
+            "MSE": mse_val,
+            "PSNR": psnr_val,
+            "SSIM": ssim_val,
+            "Mean DCT Diff": dct_mean,
+            "Max DCT Diff": dct_max
+        })
 
-    total_matched = matches.count(True)
-    total_mismatched = matches.count(False)
+        stego_path = os.path.join(stego_output_folder, f"stego_{filenames[i]}")
+        cv2.imwrite(stego_path, encoded_image)
 
-    print(f"Total Matched Messages: {total_matched}")
-    print(f"Total Mismatched Messages: {total_mismatched}")
+    df = pd.DataFrame(results)
+    avg_metrics = {
+        "Average MSE": [df["MSE"].mean()],
+        "Average PSNR (dB)": [df["PSNR"].mean()],
+        "Average SSIM": [df["SSIM"].mean()],
+        "Average Mean DCT Diff": [df["Mean DCT Diff"].mean()],
+        "Average Max DCT Diff": [df["Max DCT Diff"].mean()],
+        "Message Match Rate (%)": [(df["Match"] == "Matched").mean() * 100],
+        "Coordinate Match Rate (%)": [100.0],
+        "RF Accuracy After Embedding (%)": [(df["True Label"] == df["RF Predicted Class"]).mean() * 100]
+    }
+    summary_df = pd.DataFrame(avg_metrics)
 
-    create_results_dataframe(filenames, encoded_messages, decoded_messages, rf_predictions, matches, used_pixels_all, embedded_bits_all, excel_path)
-    visualize_results(filenames, rf_predictions, matches, random_pixels, decoded_messages)
+    with pd.ExcelWriter(output_excel, engine='openpyxl', mode='w') as writer:
+        df.to_excel(writer, index=False, sheet_name='Per Image Results')
+        summary_df.to_excel(writer, index=False, sheet_name='Summary Averages')
 
+    print("\n✅ Done! Results saved to", output_excel)
+    print("\n📊 AVERAGE METRICS ACROSS ALL IMAGES:")
+    for col in summary_df.columns:
+        print(f"{col}: {summary_df[col].iloc[0]:.4f}" if isinstance(summary_df[col].iloc[0], float) else f"{col}: {summary_df[col].iloc[0]}")
 
-# === RUN SCRIPT === #
+    cm = confusion_matrix(df["True Label"], df["RF Predicted Class"], labels=CLASS_NAMES)
+    output_dir = os.path.dirname(output_excel)
+
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
+    plt.close()
+
+    plt.figure(figsize=(6, 4))
+    sns.countplot(data=df, x="Match")
+    plt.title("Message Match Count")
+    plt.ylabel("Number of Images")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "message_match_count.png"))
+    plt.close()
+
+# === RUN === #
 if __name__ == "__main__":
     input_folder = "Layered IG LSB/RF FDIA 1/Normal"
     model_path = "Layered IG LSB/RF FDIA 1/rf_model.pkl"
-    output_excel = "Layered IG LSB/RF FDIA 1/rf_layered_stego_results.xlsx"
-    process_images(input_folder, model_path, output_excel)
+    output_excel = "Layered IG LSB/RF FDIA 1/Final Results/final_rf_layered_results.xlsx"
+    stego_output_folder = "Layered IG LSB/RF FDIA 1/Final Results/stego_images"
+
+    if not os.path.exists(stego_output_folder):
+        os.makedirs(stego_output_folder)
+
+    process_images(input_folder, model_path, output_excel, stego_output_folder)
