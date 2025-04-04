@@ -19,14 +19,16 @@ MESSAGE_LENGTH = 4  # 4 characters
 BITS_PER_CHAR = 8
 TOTAL_BITS = MESSAGE_LENGTH * BITS_PER_CHAR
 CLASS_NAMES = ['Normal', 'Attack']
+RESERVED_BITS = 1024  # First 1024 pixels reserved for coordinate metadata
 
-# === UTILS === #
+# === MESSAGE UTILS === #
 def generate_random_message(length=4):
     return ''.join(random.choices(string.ascii_uppercase, k=length))
 
 def sanitize_string(input_string):
     return ''.join([char if ord(char) < 128 else '' for char in input_string]).strip()
 
+# === EMBEDDING & DECODING === #
 def lsb_encode(image, message, positions):
     encoded_image = image.copy()
     message_bits = ''.join(format(ord(char), '08b') for char in message)
@@ -54,6 +56,35 @@ def lsb_decode(image, positions, length):
             bit_string = ''
     return ''.join(decoded_message)
 
+# === COORDINATE METADATA UTILS === #
+def coords_to_bits(coords, bits_per_coord=16):
+    bits = []
+    for y, x in coords:
+        y_bits = format(y, f'0{bits_per_coord}b')
+        x_bits = format(x, f'0{bits_per_coord}b')
+        bits.extend(int(b) for b in y_bits + x_bits)
+    return bits
+
+def bits_to_coords(bits, bits_per_coord=16):
+    coords = []
+    for i in range(0, len(bits), 2 * bits_per_coord):
+        y = int(''.join(map(str, bits[i:i+bits_per_coord])), 2)
+        x = int(''.join(map(str, bits[i+bits_per_coord:i+2*bits_per_coord])), 2)
+        coords.append((y, x))
+    return coords
+
+def embed_metadata(image, meta_bits):
+    flat = image.flatten()
+    for i in range(len(meta_bits)):
+        flat[i] = (flat[i] & ~(1 << 7)) | (meta_bits[i] << 7)
+    return flat.reshape(image.shape)
+
+def extract_metadata(image, reserved_bits=RESERVED_BITS):
+    flat = image.flatten()
+    bits = [(flat[i] >> 7) & 1 for i in range(reserved_bits)]
+    return bits_to_coords(bits)
+
+# === QUALITY METRICS === #
 def calculate_mse(original, stego):
     return np.mean((original.astype(np.float32) - stego.astype(np.float32)) ** 2)
 
@@ -69,6 +100,7 @@ def compute_dct_difference(original, stego):
     diff = np.abs(original_dct - stego_dct)
     return np.mean(diff), np.max(diff)
 
+# === SHAP PIXEL SELECTION === #
 def shap_pixel_selection(image, model, num_pixels=32):
     image_flattened = image.flatten().reshape(1, -1)
     explainer = shap.TreeExplainer(model)
@@ -77,6 +109,7 @@ def shap_pixel_selection(image, model, num_pixels=32):
     top_indices = np.argsort(flat_shap_values)[-num_pixels:]
     return [(idx // image.shape[1], idx % image.shape[1]) for idx in top_indices]
 
+# === IMAGE I/O === #
 def load_images_from_folder(folder_path):
     images, filenames = [], []
     for filename in os.listdir(folder_path):
@@ -88,6 +121,7 @@ def load_images_from_folder(folder_path):
             filenames.append(filename)
     return images, filenames
 
+# === MAIN PROCESS === #
 def process_images(folder_path, model_path, output_excel, stego_output_folder):
     images, filenames = load_images_from_folder(folder_path)
     rf_model = joblib.load(model_path)
@@ -101,9 +135,15 @@ def process_images(folder_path, model_path, output_excel, stego_output_folder):
 
         message = generate_random_message()
         encoded_image, used_pixels, embedded_bits = lsb_encode(image, message, selected_pixels)
-        rf_prediction = rf_model.predict([encoded_image.flatten()])[0]
-        rf_class_label = CLASS_NAMES[rf_prediction] if rf_prediction < len(CLASS_NAMES) else 'Unknown'
-        decoded_message = lsb_decode(encoded_image, selected_pixels, len(message))
+
+        coord_bits = coords_to_bits(selected_pixels)
+        encoded_image = embed_metadata(encoded_image, coord_bits)
+
+        stego_path = os.path.join(stego_output_folder, f"stego_{filenames[i]}")
+        cv2.imwrite(stego_path, encoded_image)
+
+        decoded_coords = extract_metadata(encoded_image, reserved_bits=RESERVED_BITS)
+        decoded_message = lsb_decode(encoded_image, decoded_coords, len(message))
 
         mse_val = calculate_mse(image, encoded_image)
         psnr_val = calculate_psnr(mse_val)
@@ -115,18 +155,16 @@ def process_images(folder_path, model_path, output_excel, stego_output_folder):
             "Original Message": sanitize_string(message),
             "Decoded Message": sanitize_string(decoded_message),
             "Match": "Matched" if message == decoded_message else "Mismatched",
-            "RF Predicted Class": rf_class_label,
+            "RF Predicted Class": CLASS_NAMES[rf_model.predict([encoded_image.flatten()])[0]],
             "True Label": true_label,
-            "Used Pixels": str(used_pixels),
+            "Used Pixels": str(selected_pixels),
+            "Decoded Coords Match": "Matched" if selected_pixels == decoded_coords else "Mismatched",
             "MSE": mse_val,
             "PSNR": psnr_val,
             "SSIM": ssim_val,
             "Mean DCT Diff": dct_mean,
             "Max DCT Diff": dct_max
         })
-
-        stego_path = os.path.join(stego_output_folder, f"stego_{filenames[i]}")
-        cv2.imwrite(stego_path, encoded_image)
 
     df = pd.DataFrame(results)
     avg_metrics = {
@@ -136,7 +174,7 @@ def process_images(folder_path, model_path, output_excel, stego_output_folder):
         "Average Mean DCT Diff": [df["Mean DCT Diff"].mean()],
         "Average Max DCT Diff": [df["Max DCT Diff"].mean()],
         "Message Match Rate (%)": [(df["Match"] == "Matched").mean() * 100],
-        "Coordinate Match Rate (%)": [100.0],
+        "Coordinate Match Rate (%)": [(df["Decoded Coords Match"] == "Matched").mean() * 100],
         "RF Accuracy After Embedding (%)": [(df["True Label"] == df["RF Predicted Class"]).mean() * 100]
     }
     summary_df = pd.DataFrame(avg_metrics)
@@ -169,6 +207,15 @@ def process_images(folder_path, model_path, output_excel, stego_output_folder):
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "message_match_count.png"))
     plt.close()
+
+    plt.figure(figsize=(6, 4))
+    sns.countplot(data=df, x="Decoded Coords Match")
+    plt.title("Coordinate Match Count")
+    plt.ylabel("Number of Images")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "coordinate_match_count.png"))
+    plt.close()
+
 
 # === RUN === #
 if __name__ == "__main__":
