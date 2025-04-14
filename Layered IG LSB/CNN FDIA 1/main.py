@@ -1,3 +1,5 @@
+# === FIXED analyze_with_cnn-style Predictions for IG + LSB Pipeline ===
+
 import os
 import cv2
 import numpy as np
@@ -22,7 +24,7 @@ BITS_PER_COORD = 16
 RESERVED_BITS = NUM_PIXELS * BITS_PER_COORD * 2
 MESSAGE_BITS = 4 * 8
 CHANNELS = 1
-CLASS_NAMES = ['Normal', 'Faulty']
+CLASS_NAMES = ['Normal', 'Attack']
 
 # === MESSAGE UTILS === #
 def generate_random_message():
@@ -75,8 +77,8 @@ def embed_metadata(image, meta_bits):
     return flat.reshape(image.shape)
 
 # === IG-BASED IMPORTANT PIXELS === #
-def get_ig_pixels(model, image_tensor, label_index, top_k=NUM_PIXELS):
-    def loss_fn(output): return output[:, label_index]
+def get_ig_pixels(model, image_tensor, top_k=NUM_PIXELS):
+    def loss_fn(output): return output[:, 0]  # Single output from sigmoid
     saliency = Saliency(model, model_modifier=ReplaceToLinear(), clone=True)
     saliency_map = saliency(loss_fn, image_tensor)
     saliency_map = np.abs(saliency_map[0])
@@ -117,9 +119,11 @@ def compute_dct_difference(original, stego):
 def process_folder(input_folder, model_path, output_excel, stego_output_folder):
     model = load_model(model_path)
     results = []
+    original_labels = []
+    original_preds = []
+    stego_preds = []
+
     image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    matched_count = 0
-    mismatched_count = 0
 
     for idx, filename in enumerate(image_files):
         print(f"[{idx + 1}/{len(image_files)}] Processing {filename}")
@@ -133,26 +137,32 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
         norm_img = image.astype(np.float32) / 255.0
         input_tensor = np.expand_dims(norm_img, axis=(0, -1))
 
-        pred_probs = model.predict(input_tensor, verbose=0)[0]
-        label_index = int(np.argmax(pred_probs))
-        ig_pixels = get_ig_pixels(model, input_tensor, label_index, top_k=NUM_PIXELS)
+        prob_orig = float(model.predict(input_tensor, verbose=0)[0])
+        pred_class_orig = CLASS_NAMES[int(prob_orig >= 0.5)]
+        print(f"Original prediction prob: {prob_orig:.4f} → Predicted class: {pred_class_orig}")
+        original_preds.append(pred_class_orig)
 
+        folder_name = os.path.basename(os.path.normpath(input_folder)).lower()
+        if folder_name == "normal":
+            true_label = "Normal"
+        elif folder_name == "attack":
+            true_label = "Attack"
+        else:
+            raise ValueError(f"Cannot determine true label from folder name: {folder_name}")
+        original_labels.append(true_label)
+
+        ig_pixels = get_ig_pixels(model, input_tensor, top_k=NUM_PIXELS)
         original_msg = generate_random_message()
         msg_bits = string_to_bits(original_msg)
         coord_bits = coords_to_bits(ig_pixels)
 
         msg_encoded_img = embed_lsb(image.copy(), msg_bits, ig_pixels)
-        cnn_input = np.expand_dims(msg_encoded_img.astype(np.float32) / 255.0, axis=(0, -1))
-        pred_probs_after_lsb = model.predict(cnn_input, verbose=0)[0]
-        pred_class_idx = int(np.argmax(pred_probs_after_lsb))
-        pred_class = CLASS_NAMES[pred_class_idx] if pred_class_idx < len(CLASS_NAMES) else 'Unknown'
-        confidence = float(pred_probs_after_lsb[pred_class_idx])
-
         final_stego = embed_metadata(msg_encoded_img, coord_bits)
-        stego_image_filename = f"stego_{filename}"
-        stego_image_path = os.path.join(stego_output_folder, stego_image_filename)
-        cv2.imwrite(stego_image_path, final_stego)
-        print(f"Stego image saved to {stego_image_path}")
+
+        cnn_input = np.expand_dims(final_stego.astype(np.float32) / 255.0, axis=(0, -1))
+        prob_stego = float(model.predict(cnn_input, verbose=0)[0])
+        pred_class_after = CLASS_NAMES[int(prob_stego >= 0.5)]
+        stego_preds.append(pred_class_after)
 
         decoded_msg, decoded_coords = decode_message_and_coords(final_stego)
         original_clean = clean_message(original_msg)
@@ -162,27 +172,23 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
         print(f"Decoded Message: {decoded_clean}")
         print(f"Messages Match: {'Matched' if original_clean == decoded_clean else 'Mismatched'}\n")
 
-        if original_clean == decoded_clean:
-            matched_count += 1
-        else:
-            mismatched_count += 1
-
-        true_label = os.path.basename(input_folder)
-        if true_label not in CLASS_NAMES:
-            true_label = 'Unknown'
-
         mse_value = calculate_mse(image, final_stego)
         psnr_value = calculate_psnr(mse_value)
         ssim_value = calculate_ssim(image, final_stego)
         mean_dct_diff, max_dct_diff = compute_dct_difference(image, final_stego)
+
+        stego_image_filename = f"stego_{filename}"
+        stego_image_path = os.path.join(stego_output_folder, stego_image_filename)
+        cv2.imwrite(stego_image_path, final_stego)
+        print(f"Stego image saved to {stego_image_path}\n")
 
         results.append({
             "Image": filename,
             "Original Message": original_clean,
             "Decoded Message": decoded_clean,
             "Match": "Matched" if original_clean == decoded_clean else "Mismatched",
-            "CNN Predicted Class": pred_class,
-            "Confidence": round(confidence, 4),
+            "CNN Predicted Class": pred_class_after,
+            "Confidence": round(prob_stego if pred_class_after == "Attack" else 1 - prob_stego, 4),
             "Encoded Coords": str(ig_pixels),
             "Decoded Coords Match": "Matched" if ig_pixels == decoded_coords else "Mismatched",
             "True Label": true_label,
@@ -194,47 +200,28 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
         })
 
     df = pd.DataFrame(results)
-    avg_mse = df["MSE"].mean()
-    avg_psnr = df["PSNR"].mean()
-    avg_ssim = df["SSIM"].mean()
-    avg_dct_mean = df["Mean DCT Diff"].mean()
-    avg_dct_max = df["Max DCT Diff"].mean()
-    message_match_rate = (df["Match"] == "Matched").mean() * 100
-    coord_match_rate = (df["Decoded Coords Match"] == "Matched").mean() * 100
-    cnn_accuracy = (df["True Label"] == df["CNN Predicted Class"]).mean() * 100
 
-    summary_data = {
-        "Average MSE": [avg_mse],
-        "Average PSNR (dB)": [avg_psnr],
-        "Average SSIM": [avg_ssim],
-        "Average Mean DCT Diff": [avg_dct_mean],
-        "Average Max DCT Diff": [avg_dct_max],
-        "Message Match Rate (%)": [message_match_rate],
-        "Coordinate Match Rate (%)": [coord_match_rate],
-        "CNN Accuracy After Embedding (%)": [cnn_accuracy]
-    }
-    summary_df = pd.DataFrame(summary_data)
+    cm_original = confusion_matrix(original_labels, original_preds, labels=CLASS_NAMES)
+    cm_stego = confusion_matrix(original_labels, stego_preds, labels=CLASS_NAMES)
 
-    with pd.ExcelWriter(output_excel, engine='openpyxl', mode='w') as writer:
-        df.to_excel(writer, index=False, sheet_name='Per Image Results')
-        summary_df.to_excel(writer, index=False, sheet_name='Summary Averages')
-
-    print("\n✅ Done! Results saved to", output_excel)
-    print("\n📊 AVERAGE METRICS ACROSS ALL IMAGES:")
-    for col in summary_df.columns:
-        print(f"{col}: {summary_df[col].iloc[0]:.4f}" if isinstance(summary_df[col].iloc[0], float) else f"{col}: {summary_df[col].iloc[0]}")
-
-    sns.set(style="whitegrid")
-    cm = confusion_matrix(df["True Label"], df["CNN Predicted Class"], labels=CLASS_NAMES)
     output_dir = os.path.dirname(output_excel)
 
     plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    sns.heatmap(cm_original, annot=True, fmt='d', cmap="Greens", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
-    plt.title("Confusion Matrix")
+    plt.title("Confusion Matrix BEFORE Embedding")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
+    plt.savefig(os.path.join(output_dir, "confusion_matrix_original.png"))
+    plt.close()
+
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm_stego, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.title("Confusion Matrix AFTER Embedding")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "confusion_matrix_stego.png"))
     plt.close()
 
     plt.figure(figsize=(6, 4))
@@ -255,12 +242,32 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
     plt.savefig(os.path.join(output_dir, "coordinate_match_count.png"))
     plt.close()
 
+    summary_df = pd.DataFrame({
+        "Average MSE": [df["MSE"].mean()],
+        "Average PSNR (dB)": [df["PSNR"].mean()],
+        "Average SSIM": [df["SSIM"].mean()],
+        "Average Mean DCT Diff": [df["Mean DCT Diff"].mean()],
+        "Average Max DCT Diff": [df["Max DCT Diff"].mean()],
+        "Message Match Rate (%)": [(df["Match"] == "Matched").mean() * 100],
+        "Coordinate Match Rate (%)": [(df["Decoded Coords Match"] == "Matched").mean() * 100],
+        "CNN Accuracy After Embedding (%)": [(df["True Label"] == df["CNN Predicted Class"]).mean() * 100]
+    })
+
+    with pd.ExcelWriter(output_excel, engine='openpyxl', mode='w') as writer:
+        df.to_excel(writer, index=False, sheet_name='Per Image Results')
+        summary_df.to_excel(writer, index=False, sheet_name='Summary Averages')
+
+    print("\n✅ Done! Results saved to", output_excel)
+    print("\n📊 AVERAGE METRICS ACROSS ALL IMAGES:")
+    for col in summary_df.columns:
+        print(f"{col}: {summary_df[col].iloc[0]:.4f}" if isinstance(summary_df[col].iloc[0], float) else f"{col}: {summary_df[col].iloc[0]}")
+
 # === RUN === #
 if __name__ == "__main__":
     input_folder = "Layered IG LSB/CNN FDIA 1/Normal"
-    model_path = "Layered IG LSB/CNN FDIA 1/cnn_2_class_model_grayscale.h5"
-    output_excel = "Layered IG LSB/CNN FDIA 1/Final Results/ig_layered_stego_results.xlsx"
-    stego_output_folder = "Layered IG LSB/CNN FDIA 1/Final Results/stego_images"
+    model_path = "Layered IG LSB/CNN FDIA 1/final_cnn_model_grayscale.h5"
+    output_excel = "Layered IG LSB/CNN FDIA 1/Final Results (Normal)/ig_layered_stego_results.xlsx"
+    stego_output_folder = "Layered IG LSB/CNN FDIA 1/Final Results (Normal)/stego_images"
 
     if not os.path.exists(stego_output_folder):
         os.makedirs(stego_output_folder)

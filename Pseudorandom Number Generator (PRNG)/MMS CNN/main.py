@@ -22,7 +22,7 @@ IMG_SIZE = (64, 64)
 NUM_PIXELS = 24
 MESSAGE_BITS = NUM_PIXELS
 CHANNELS = 1
-CLASS_NAMES = ['Normal', 'Faulty', 'Attack']
+CLASS_NAMES = ['Normal', 'Attack', 'Faulty']
 SEED_MODE = 'hash'
 SEED_RESERVED_PIXELS = 150
 SEED_SECRET_KEY = "my_shared_passphrase"
@@ -263,10 +263,10 @@ def process_folder(input_folder, model_path, stego_output_folder, results_output
     print(f"\u2705 All results saved to: {results_output_folder}")
 
 # === RUN === #
-input_folder = "PRNG/MMS/MMS Images/Normal"
-model_path = "PRNG/MMS/MMS Images/cnn_3_class_grayscale_model_64x64.h5"
-stego_output_folder = "PRNG/MMS/Double PRNG/stego_images"
-results_output_folder = "PRNG/MMS/Double PRNG"
+input_folder = "PRNG/MMS/MMS Images/Attack"
+model_path = "PRNG/MMS/cnn_best_model.h5"
+stego_output_folder = "PRNG/MMS/Final Result (Attack)/stego_images"
+results_output_folder = "PRNG/MMS/Final Result (Attack)"
 seed_secret_key = "Gustavo_Sanchez"
 
 process_folder(input_folder, model_path, stego_output_folder, results_output_folder, seed_secret_key)

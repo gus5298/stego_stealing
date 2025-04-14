@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import shap
 import cv2
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 import seaborn as sns
 import random
@@ -18,15 +18,18 @@ IMG_SIZE = (128, 128)
 MESSAGE_LENGTH = 4  # 4 characters
 BITS_PER_CHAR = 8
 TOTAL_BITS = MESSAGE_LENGTH * BITS_PER_CHAR
-CLASS_NAMES = ['Normal', 'Attack']
+CLASS_NAMES = None
 RESERVED_BITS = 1024  # First 1024 pixels reserved for coordinate metadata
 
-# === MESSAGE UTILS === #
+# === UTILS === #
 def generate_random_message(length=4):
     return ''.join(random.choices(string.ascii_uppercase, k=length))
 
 def sanitize_string(input_string):
     return ''.join([char if ord(char) < 128 else '' for char in input_string]).strip()
+
+def normalize_label(label):
+    return str(label).strip().lower()
 
 # === EMBEDDING & DECODING === #
 def lsb_encode(image, message, positions):
@@ -121,21 +124,50 @@ def load_images_from_folder(folder_path):
             filenames.append(filename)
     return images, filenames
 
+# === CONFUSION MATRIX PLOTTING === #
+def save_confusion_matrix(y_true, y_pred, label_map, title, save_path, cmap="Blues"):
+    present_labels = sorted(list(set(y_true) | set(y_pred)))
+    cm = confusion_matrix(y_true, y_pred, labels=present_labels)
+    display_labels = [label_map.get(l, l.capitalize()) for l in present_labels]
+
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    disp.plot(ax=ax, cmap=cmap, values_format='d')
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 # === MAIN PROCESS === #
-def process_images(folder_path, model_path, output_excel, stego_output_folder):
+def process_images(folder_path, model_path, output_excel, stego_output_folder, generate_confusion_matrix=True):
     images, filenames = load_images_from_folder(folder_path)
     rf_model = joblib.load(model_path)
 
+    rf_estimator = rf_model.named_steps['rf'] if hasattr(rf_model, 'named_steps') else rf_model
+
+    global CLASS_NAMES
+    CLASS_NAMES = list(rf_model.classes_)
+    class_labels_lower = [c.lower() for c in CLASS_NAMES]
+    label_map = dict(zip(class_labels_lower, CLASS_NAMES))
+
     results = []
-    true_label = next((label for label in CLASS_NAMES if label.lower() in folder_path.lower()), 'Unknown')
+    folder_path_lower = os.path.basename(folder_path).lower()
+    if folder_path_lower == 'normal':
+        true_label = 'normal'
+    elif folder_path_lower == 'attack':
+        true_label = 'attack'
+    else:
+        raise ValueError(f"❌ Could not determine true label from folder name: {folder_path_lower}")
 
     for i, image in enumerate(images):
         print(f"[{i+1}/{len(images)}] Processing {filenames[i]}")
-        selected_pixels = shap_pixel_selection(image, rf_model, num_pixels=TOTAL_BITS)
 
+        pred_orig = rf_model.predict([image.flatten()])[0]
+        original_pred = normalize_label(pred_orig)
+
+        selected_pixels = shap_pixel_selection(image, rf_estimator, num_pixels=TOTAL_BITS)
         message = generate_random_message()
         encoded_image, used_pixels, embedded_bits = lsb_encode(image, message, selected_pixels)
-
         coord_bits = coords_to_bits(selected_pixels)
         encoded_image = embed_metadata(encoded_image, coord_bits)
 
@@ -150,12 +182,16 @@ def process_images(folder_path, model_path, output_excel, stego_output_folder):
         ssim_val = calculate_ssim(image, encoded_image)
         dct_mean, dct_max = compute_dct_difference(image, encoded_image)
 
+        pred_stego = rf_model.predict([encoded_image.flatten()])[0]
+        stego_pred = normalize_label(pred_stego)
+
         results.append({
             "Image": filenames[i],
             "Original Message": sanitize_string(message),
             "Decoded Message": sanitize_string(decoded_message),
             "Match": "Matched" if message == decoded_message else "Mismatched",
-            "RF Predicted Class": CLASS_NAMES[rf_model.predict([encoded_image.flatten()])[0]],
+            "RF Predicted Class (Original)": original_pred,
+            "RF Predicted Class": stego_pred,
             "True Label": true_label,
             "Used Pixels": str(selected_pixels),
             "Decoded Coords Match": "Matched" if selected_pixels == decoded_coords else "Mismatched",
@@ -167,7 +203,8 @@ def process_images(folder_path, model_path, output_excel, stego_output_folder):
         })
 
     df = pd.DataFrame(results)
-    avg_metrics = {
+
+    summary_df = pd.DataFrame({
         "Average MSE": [df["MSE"].mean()],
         "Average PSNR (dB)": [df["PSNR"].mean()],
         "Average SSIM": [df["SSIM"].mean()],
@@ -175,30 +212,34 @@ def process_images(folder_path, model_path, output_excel, stego_output_folder):
         "Average Max DCT Diff": [df["Max DCT Diff"].mean()],
         "Message Match Rate (%)": [(df["Match"] == "Matched").mean() * 100],
         "Coordinate Match Rate (%)": [(df["Decoded Coords Match"] == "Matched").mean() * 100],
-        "RF Accuracy After Embedding (%)": [(df["True Label"] == df["RF Predicted Class"]).mean() * 100]
-    }
-    summary_df = pd.DataFrame(avg_metrics)
+        "RF Accuracy After Embedding (%)": [(df["True Label"] == df["RF Predicted Class"]).mean() * 100],
+        "RF Accuracy Before Embedding (%)": [(df["True Label"] == df["RF Predicted Class (Original)"]).mean() * 100]
+    })
 
     with pd.ExcelWriter(output_excel, engine='openpyxl', mode='w') as writer:
         df.to_excel(writer, index=False, sheet_name='Per Image Results')
         summary_df.to_excel(writer, index=False, sheet_name='Summary Averages')
 
-    print("\n✅ Done! Results saved to", output_excel)
-    print("\n📊 AVERAGE METRICS ACROSS ALL IMAGES:")
-    for col in summary_df.columns:
-        print(f"{col}: {summary_df[col].iloc[0]:.4f}" if isinstance(summary_df[col].iloc[0], float) else f"{col}: {summary_df[col].iloc[0]}")
-
-    cm = confusion_matrix(df["True Label"], df["RF Predicted Class"], labels=CLASS_NAMES)
     output_dir = os.path.dirname(output_excel)
 
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
-    plt.xlabel("Predicted Label")
-    plt.ylabel("True Label")
-    plt.title("Confusion Matrix")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
-    plt.close()
+    if generate_confusion_matrix:
+        save_confusion_matrix(
+            y_true=df["True Label"],
+            y_pred=df["RF Predicted Class"],
+            label_map=label_map,
+            title="Confusion Matrix (After Embedding)",
+            save_path=os.path.join(output_dir, "confusion_matrix.png"),
+            cmap="Blues"
+        )
+
+        save_confusion_matrix(
+            y_true=df["True Label"],
+            y_pred=df["RF Predicted Class (Original)"],
+            label_map=label_map,
+            title="Confusion Matrix (Original Images)",
+            save_path=os.path.join(output_dir, "confusion_matrix_original.png"),
+            cmap="Greens"
+        )
 
     plt.figure(figsize=(6, 4))
     sns.countplot(data=df, x="Match")
@@ -220,11 +261,11 @@ def process_images(folder_path, model_path, output_excel, stego_output_folder):
 # === RUN === #
 if __name__ == "__main__":
     input_folder = "Layered IG LSB/RF FDIA 1/Normal"
-    model_path = "Layered IG LSB/RF FDIA 1/rf_model.pkl"
-    output_excel = "Layered IG LSB/RF FDIA 1/Final Results/final_rf_layered_results.xlsx"
-    stego_output_folder = "Layered IG LSB/RF FDIA 1/Final Results/stego_images"
+    model_path = "Layered IG LSB/RF FDIA 1/best_rf_model.pkl"
+    output_excel = "Layered IG LSB/RF FDIA 1/Final Results (Normal)/final_rf_layered_results.xlsx"
+    stego_output_folder = "Layered IG LSB/RF FDIA 1/Final Results (Normal)/stego_images"
 
     if not os.path.exists(stego_output_folder):
         os.makedirs(stego_output_folder)
 
-    process_images(input_folder, model_path, output_excel, stego_output_folder)
+    process_images(input_folder, model_path, output_excel, stego_output_folder, generate_confusion_matrix=False)

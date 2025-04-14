@@ -21,8 +21,7 @@ IMG_SIZE = (128, 128)
 NUM_PIXELS = 24
 MESSAGE_BITS = NUM_PIXELS
 CHANNELS = 1
-CLASS_NAMES = ['Normal', 'Attack']
-SEED_MODE = 'hash'
+CLASS_NAMES = None
 SEED_RESERVED_PIXELS = 300
 SEED_SECRET_KEY = "my_shared_passphrase"
 
@@ -109,13 +108,12 @@ def extract_rf_features(image):
     return (image.flatten() / 255.0)
 
 # === RF ANALYSIS === #
-def analyze_with_rf(stego_image, rf_model):
-    features = extract_rf_features(stego_image).reshape(1, -1)
+def analyze_with_rf(image, rf_model):
+    features = extract_rf_features(image).reshape(1, -1)
     prediction = rf_model.predict(features)[0]
     proba = rf_model.predict_proba(features)[0]
     confidence = max(proba)
-    predicted_class = CLASS_NAMES[prediction]
-    return predicted_class, confidence
+    return prediction, confidence
 
 # === IMAGE QUALITY METRICS === #
 def calculate_mse(original, stego):
@@ -141,23 +139,37 @@ def decode_message(image, coords):
     msg_bits = [flat[y * image.shape[1] + x] & 1 for y, x in coords[:NUM_PIXELS]]
     return bits_to_string(msg_bits)
 
-
 # === MAIN PROCESSING FUNCTION === #
 def process_folder(input_folder, model_path, stego_output_folder, results_output_folder, seed_secret_key):
+    global CLASS_NAMES
     rf_model = joblib.load(model_path)
+    CLASS_NAMES = list(rf_model.classes_)
     results = []
 
     if not os.path.exists(stego_output_folder):
         os.makedirs(stego_output_folder)
 
-    image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    # 🔧 Walk through folders and collect image paths + true labels
+    image_files = []
+    true_labels = []
+    for root, _, files in os.walk(input_folder):
+        for file in files:
+            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                image_path = os.path.join(root, file)
+                image_files.append(image_path)
+                label = os.path.basename(root).capitalize()
+                true_labels.append(label)
 
-    for filename in image_files:
-        print(f"Processing: {filename}")
-        image_path = os.path.join(input_folder, filename)
+    for i, image_path in enumerate(image_files):
+        filename = os.path.basename(image_path)
+        true_label = true_labels[i]
+
+        print(f"Processing: {filename} | True Label: {true_label}")
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         image = cv2.resize(image, IMG_SIZE)
         image = image.astype(np.uint8)
+
+        original_pred_class, original_confidence = analyze_with_rf(image, rf_model)
 
         seed_value = get_seed_from_image(seed_secret_key, image)
         seed_bits = [int(b) for b in format(seed_value, '032b')]
@@ -187,6 +199,7 @@ def process_folder(input_folder, model_path, stego_output_folder, results_output
 
         results.append({
             "Image": filename,
+            "True Label": true_label,
             "Original Message": original_msg,
             "Decoded Message": decoded_msg,
             "Message Match": msg_match_status,
@@ -194,7 +207,9 @@ def process_folder(input_folder, model_path, stego_output_folder, results_output
             "Extracted Seed": extracted_seed,
             "Key Match": key_match_status,
             "RF Predicted Class": pred_class,
+            "RF Predicted Class (Original)": original_pred_class,
             "Confidence": confidence,
+            "Confidence (Original)": original_confidence,
             "Stego Image Path": stego_image_path,
             "MSE": round(mse_value, 4),
             "PSNR": round(psnr_value, 2),
@@ -213,19 +228,18 @@ def process_folder(input_folder, model_path, stego_output_folder, results_output
         "Max DCT Diff": df["Max DCT Diff"].mean()
     }
 
-    if "True Label" not in df.columns:
-        df["True Label"] = "Normal"
-
     df_filtered = df[df["Image"] != "AVERAGE"]
-    cm = confusion_matrix(df_filtered["True Label"], df_filtered["RF Predicted Class"], labels=CLASS_NAMES)
+    cm_stego = confusion_matrix(df_filtered["True Label"], df_filtered["RF Predicted Class"], labels=CLASS_NAMES)
+    cm_original = confusion_matrix(df_filtered["True Label"], df_filtered["RF Predicted Class (Original)"], labels=CLASS_NAMES)
 
     output_excel = os.path.join(results_output_folder, "stego_analysis_results_with_metrics.xlsx")
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
         df_filtered.to_excel(writer, index=False, sheet_name="Per Image Results")
         pd.DataFrame([avg_metrics]).to_excel(writer, index=False, sheet_name="Summary Averages")
 
+    # Save confusion matrices
     plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    sns.heatmap(cm_stego, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
     plt.title("Confusion Matrix for Stego Images")
@@ -233,6 +247,16 @@ def process_folder(input_folder, model_path, stego_output_folder, results_output
     plt.savefig(os.path.join(results_output_folder, "stego_confusion_matrix.png"))
     plt.close()
 
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm_original, annot=True, fmt='d', cmap="Greens", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.title("Confusion Matrix for Original Images")
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_output_folder, "original_confusion_matrix.png"))
+    plt.close()
+
+    # Plot match counts
     plt.figure(figsize=(6, 4))
     sns.countplot(data=df, x="Key Match")
     plt.title("Seed Match Count (Initial PRNG)")
@@ -253,11 +277,14 @@ def process_folder(input_folder, model_path, stego_output_folder, results_output
 
     print(f"\u2705 All results saved to: {results_output_folder}")
 
+
+
+
 # === INPUT PATHS === #
-input_folder = "PRNG/FDIA 1/RF/Images FDIA 1/Normal"
-model_path = "PRNG/FDIA 1/RF/rf_model.pkl"
-stego_output_folder = "PRNG/FDIA 1/RF/Double PRNG/stego_images"
-results_output_folder = "PRNG/FDIA 1/RF/Double PRNG"
+input_folder = "PRNG/FDIA 1/RF/Images FDIA 1/Attack"
+model_path = "PRNG/FDIA 1/RF/best_rf_model.pkl"
+stego_output_folder = "PRNG/FDIA 1/RF/Final Results (Attack)/stego_images"
+results_output_folder = "PRNG/FDIA 1/RF/Final Results (Attack)"
 seed_secret_key = "Gustavo_Sanchez"
 
 process_folder(input_folder, model_path, stego_output_folder, results_output_folder, seed_secret_key)

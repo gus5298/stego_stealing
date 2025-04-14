@@ -22,7 +22,7 @@ BITS_PER_COORD = 16
 RESERVED_BITS = NUM_PIXELS * BITS_PER_COORD * 2
 MESSAGE_BITS = 2 * 8
 CHANNELS = 1
-CLASS_NAMES = ['Normal', 'Faulty', 'Attack']
+CLASS_NAMES = ['Normal', 'Attack', 'Faulty']
 
 # === MESSAGE UTILS === #
 def generate_random_message():
@@ -121,6 +121,9 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
     matched_count = 0
     mismatched_count = 0
 
+    original_labels = []
+    original_preds = []
+
     for idx, filename in enumerate(image_files):
         print(f"[{idx + 1}/{len(image_files)}] Processing {filename}")
         image_path = os.path.join(input_folder, filename)
@@ -135,6 +138,13 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
 
         pred_probs = model.predict(input_tensor, verbose=0)[0]
         label_index = int(np.argmax(pred_probs))
+        true_label = os.path.basename(input_folder)
+        if true_label not in CLASS_NAMES:
+            true_label = 'Unknown'
+
+        original_labels.append(true_label)
+        original_preds.append(CLASS_NAMES[label_index])
+
         ig_pixels = get_ig_pixels(model, input_tensor, label_index, top_k=NUM_PIXELS)
 
         original_msg = generate_random_message()
@@ -166,10 +176,6 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
             matched_count += 1
         else:
             mismatched_count += 1
-
-        true_label = os.path.basename(input_folder)
-        if true_label not in CLASS_NAMES:
-            true_label = 'Unknown'
 
         mse_value = calculate_mse(image, final_stego)
         psnr_value = calculate_psnr(mse_value)
@@ -223,24 +229,31 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
     print("\n📊 AVERAGE METRICS ACROSS ALL IMAGES:")
     for col in summary_df.columns:
         print(f"{col}: {summary_df[col].iloc[0]:.4f}" if isinstance(summary_df[col].iloc[0], float) else f"{col}: {summary_df[col].iloc[0]}")
-    
 
     # === Visualization === #
     sns.set(style="whitegrid")
-    cm = confusion_matrix(df["True Label"], df["CNN Predicted Class"], labels=CLASS_NAMES)
     output_dir = os.path.dirname(output_excel)
 
-    # Confusion Matrix Plot
+    cm_original = confusion_matrix(original_labels, original_preds, labels=CLASS_NAMES)
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm_original, annot=True, fmt='d', cmap="Greens", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.title("Confusion Matrix BEFORE Embedding")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "confusion_matrix_original.png"))
+    plt.close()
+
+    cm = confusion_matrix(df["True Label"], df["CNN Predicted Class"], labels=CLASS_NAMES)
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
-    plt.title("Confusion Matrix")
+    plt.title("Confusion Matrix AFTER Embedding")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
     plt.close()
 
-    # Message Match Count Plot
     plt.figure(figsize=(6, 4))
     sns.countplot(data=df, x="Match")
     plt.title("Message Match Count")
@@ -250,7 +263,6 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
     plt.savefig(os.path.join(output_dir, "message_match_count.png"))
     plt.close()
 
-    # Coordinate Match Count Plot
     plt.figure(figsize=(6, 4))
     sns.countplot(data=df, x="Decoded Coords Match")
     plt.title("Coordinate Match Count")
@@ -264,11 +276,11 @@ def process_folder(input_folder, model_path, output_excel, stego_output_folder):
 # === Run === #
 if __name__ == "__main__":
     input_folder = "Layered IG LSB/CNN MMS/Normal"
-    model_path = "Layered IG LSB/CNN MMS/cnn_3_class_grayscale_model_64x64.h5"
-    output_excel = "Layered IG LSB/CNN MMS/Final Results/ig_layered_stego_results.xlsx"
+    model_path = "Layered IG LSB/CNN MMS/cnn_best_model.h5"
+    output_excel = "Layered IG LSB/CNN MMS/Final Results (Normal)/ig_layered_stego_results.xlsx"
     
     # Specify the path for saving stego images
-    stego_output_folder = "Layered IG LSB/CNN MMS/Final Results/stego_images"  # Path where stego images will be saved
+    stego_output_folder = "Layered IG LSB/CNN MMS/Final Results (Normal)/stego_images"  # Path where stego images will be saved
 
     # Ensure the stego images directory exists
     if not os.path.exists(stego_output_folder):
