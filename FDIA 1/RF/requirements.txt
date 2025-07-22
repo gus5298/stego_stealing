@@ -1,0 +1,9 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+seaborn
+jupyter
+Pillow               # for image loading/saving
+scikit-image         # for PSNR, SSIM, etc.
+joblib               # if you're saving/loading RF models
