@@ -1,0 +1,10 @@
+numpy
+matplotlib
+opencv-python
+scikit-learn
+scikit-image
+scipy
+pandas
+openpyxl
+tensorflow
+tf-keras-vis
