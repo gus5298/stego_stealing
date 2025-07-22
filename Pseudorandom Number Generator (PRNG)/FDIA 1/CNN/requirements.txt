@@ -1,0 +1,10 @@
+cv2
+hashlib
+matplotlib
+numpy
+pandas
+scipy
+seaborn
+skimage
+sklearn
+tensorflow
